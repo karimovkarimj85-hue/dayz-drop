@@ -32,7 +32,8 @@ def start_kb(is_admin: bool, cart_count: int = 0) -> InlineKeyboardMarkup:
     if WEBAPP_URL:
         rows.append([_app_button("🛍 Открыть магазин (мини-апп)")])
     rows.append([_cb("👕 Каталог", "cat"), _cb(f"🛒 Корзина{f' ({cart_count})' if cart_count else ''}", "cart")])
-    rows.append([_cb("📦 Мои заказы", "my_orders"), _cb("💬 Поддержка", "support")])
+    rows.append([_cb("📦 Мои заказы", "my_orders"), _cb("👤 Профиль и баллы", "profile")])
+    rows.append([_cb("💬 Поддержка", "support")])
     if is_admin:
         rows.append([_cb("⚙️ Админ-панель", "adm")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -78,3 +79,29 @@ def choose_order_kb(orders: list) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text=f"Заказ #{o.id}", callback_data=f"rcpt:{o.id}")] for o in orders
         ]
     )
+
+
+def rate_kb(order_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[_cb("⭐" * n, f"rate:{order_id}:{n}") for n in (1, 2, 3)],
+                                                 [_cb("⭐" * n, f"rate:{order_id}:{n}") for n in (4, 5)]])
+
+
+def product_kb(product_id: int) -> InlineKeyboardMarkup:
+    rows = []
+    if WEBAPP_URL:
+        rows.append([_app_button("🛍 Смотреть", page="product", id=product_id)])
+    rows.append([_cb("👕 Каталог", "cat")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def profile_kb() -> InlineKeyboardMarkup:
+    rows = [[_cb("👤 Профиль и баллы", "profile")]]
+    if WEBAPP_URL:
+        rows.append([_app_button("🎁 Обменять баллы в мини-аппе", page="profile")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def shop_open_kb() -> InlineKeyboardMarkup:
+    if WEBAPP_URL:
+        return InlineKeyboardMarkup(inline_keyboard=[[_app_button("🛍 Смотреть в магазине")]])
+    return InlineKeyboardMarkup(inline_keyboard=[[_cb("👕 Открыть каталог", "cat")]])

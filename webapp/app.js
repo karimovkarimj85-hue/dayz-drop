@@ -1,4 +1,5 @@
 "use strict";
+/* DAYZ DROP — мини-апп: ядро, навигация и экраны покупателя. Экраны админки — в admin.js. */
 
 const tg = window.Telegram && window.Telegram.WebApp;
 const qs = new URLSearchParams(location.search);
@@ -11,25 +12,29 @@ const $toast = document.getElementById("toast");
 const STATUS = {
   awaiting_payment: "Ожидает оплаты",
   checking: "Проверяем оплату",
+  confirmed: "Оплата при получении",
   paid: "Оплачен",
-  shipped: "Отправлен",
+  shipped: "В пути",
   done: "Получен",
   cancelled: "Отменён",
 };
 
+const ROOTS = { catalog: "catalog", cart: "cart", orders: "orders", profile: "profile", admin: "admin" };
+
 const state = {
-  me: null,
+  me: { registered: false, points: 0 },
   isAdmin: false,
   botUsername: null,
-  settings: { currency: "₽", delivery_options: [], payment_details: "" },
+  settings: { currency: "сум", delivery_methods: [], card_payments: false, loyalty_enabled: true, earn_percent: 5, welcome_points: 0 },
   products: [],
-  cart: loadCart(),
+  cart: loadJSON("dayz_cart", []),
+  favorites: new Set(),
+  subs: new Set(),
   tab: "catalog",
-  stack: [],
+  stacks: Object.fromEntries(Object.keys(ROOTS).map((k) => [k, [{ name: ROOTS[k] }]])),
   category: "Все",
-  adminTab: "orders",
-  adminStatus: "",
-  adminProducts: [],
+  sort: "new",
+  checkout: { delivery: null, payment: null, coupon: "" },
 };
 
 // ---------- иконки (линейные, в духе SF Symbols) ----------
@@ -38,6 +43,8 @@ const ICON_PATHS = {
   bag: '<path d="M5.5 8h13l-1 12.5h-11z"/><path d="M9 8V6.5a3 3 0 0 1 6 0V8"/>',
   cart: '<path d="M3 4h2.2l2.3 10.5h10.3L20 7.2H6.2"/><circle cx="9" cy="19" r="1.4"/><circle cx="17" cy="19" r="1.4"/>',
   box: '<path d="M21 8 12 3 3 8v8l9 5 9-5z"/><path d="m3 8 9 5 9-5M12 13v8"/>',
+  user: '<circle cx="12" cy="8" r="3.8"/><path d="M4.5 20c.8-3.6 3.8-5.5 7.5-5.5s6.7 1.9 7.5 5.5"/>',
+  users: '<circle cx="9" cy="8" r="3.2"/><path d="M3 19c.6-3 3-4.6 6-4.6s5.4 1.6 6 4.6"/><path d="M15.5 4.9a3.2 3.2 0 0 1 0 6.2M17.5 14.6c2 .5 3.2 2 3.5 4.4"/>',
   sliders: '<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/>',
   chevronRight: '<path d="m9 5 7 7-7 7"/>',
   chevronLeft: '<path d="m15 5-7 7 7 7"/>',
@@ -55,26 +62,36 @@ const ICON_PATHS = {
   truck: '<path d="M2.5 6h11v10h-11zM13.5 9.5H18l3 3.5V16h-7.5"/><circle cx="7" cy="17.5" r="1.8"/><circle cx="17" cy="17.5" r="1.8"/>',
   hanger: '<path d="M10 6.5a2 2 0 1 1 2.6 1.9c-.4.1-.6.5-.6.9v.7L3.5 15.5A1.4 1.4 0 0 0 4.3 18h15.4a1.4 1.4 0 0 0 .8-2.5L12 10"/>',
   card: '<rect x="3" y="5.5" width="18" height="13" rx="2.5"/><path d="M3 10h18M7 15h4"/>',
-  search: '<circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.2-4.2"/>',
+  cash: '<rect x="2.5" y="6" width="19" height="12" rx="2"/><circle cx="12" cy="12" r="2.6"/><path d="M6 9.5v5M18 9.5v5"/>',
   checkCircle: '<circle cx="12" cy="12" r="8.5"/><path d="m8.5 12.3 2.4 2.4 4.6-5"/>',
   xCircle: '<circle cx="12" cy="12" r="8.5"/><path d="m9 9 6 6M15 9l-6 6"/>',
   warning: '<path d="M12 4 2.8 19.5h18.4z"/><path d="M12 10v4.5M12 17.3v.2"/>',
-  person: '<circle cx="12" cy="8" r="3.8"/><path d="M4.5 20c.8-3.6 3.8-5.5 7.5-5.5s6.7 1.9 7.5 5.5"/>',
   chart: '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
-  arrowUp: '<path d="M12 19V5M6 11l6-6 6 6"/>',
   arrowDown: '<path d="M12 5v14M6 13l6 6 6-6"/>',
   arrowBack: '<path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/>',
   pencil: '<path d="M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16z"/><path d="m13.5 6.5 4 4"/>',
+  wallet: '<path d="M4 7.5A2.5 2.5 0 0 1 6.5 5H18v4"/><rect x="3.5" y="8" width="17" height="11" rx="2.5"/><circle cx="16" cy="13.5" r="1.3"/>',
+  gift: '<rect x="3.5" y="9" width="17" height="11" rx="2"/><path d="M3 9h18v-2H3zM12 7v13"/><path d="M12 7c-1.5-3-5-3-5-1s3 1 5 1zM12 7c1.5-3 5-3 5-1s-3 1-5 1z"/>',
+  ticket: '<path d="M3.5 8.5V6h17v2.5a2.5 2.5 0 0 0 0 5V16h-17v-2.5a2.5 2.5 0 0 0 0-5z"/><path d="M14 6v10" stroke-dasharray="2 2"/>',
+  megaphone: '<path d="M4 10v4h3l7 4V6l-7 4z"/><path d="M17.5 9a4 4 0 0 1 0 6M7 14l1 5h2"/>',
+  download: '<path d="M12 4v11M7.5 10.5 12 15l4.5-4.5M5 19.5h14"/>',
+  gear: '<circle cx="12" cy="12" r="3"/><path d="M12 2.8v2.4M12 18.8v2.4M4.2 7.5l2 1.2M17.8 15.3l2 1.2M4.2 16.5l2-1.2M17.8 8.7l2-1.2"/><circle cx="12" cy="12" r="7"/>',
+  bell: '<path d="M6 16.5V11a6 6 0 0 1 12 0v5.5l1.5 1.5h-15z"/><path d="M10 20a2 2 0 0 0 4 0"/>',
+  star: '<path d="m12 3.5 2.6 5.3 5.9.9-4.3 4.1 1 5.8L12 16.9l-5.2 2.7 1-5.8-4.3-4.1 5.9-.9z"/>',
+  sparkle: '<path d="M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5 18 18M6 18l2.5-2.5M15.5 8.5 18 6"/>',
+  search: '<circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.2-4.2"/>',
+  tag: '<path d="M3.5 12.5V4h8.5l8.5 8.5-8.5 8.5z"/><circle cx="8" cy="8.5" r="1.4"/>',
   rub: '<path d="M8 20V4h5.5a4 4 0 0 1 0 8H6M6 16h8"/>',
 };
-
+const HEART_SVG = '<svg viewBox="0 0 24 24"><path d="M12 20.5s-7.5-4.6-7.5-10.2A4.3 4.3 0 0 1 12 7.6a4.3 4.3 0 0 1 7.5 2.7c0 5.6-7.5 10.2-7.5 10.2z"/></svg>';
+const STAR_SVG = '<svg viewBox="0 0 24 24"><path d="m12 2.8 2.8 5.7 6.3.9-4.6 4.4 1.1 6.2L12 17l-5.6 3 1.1-6.2L2.9 9.4l6.3-.9z"/></svg>';
 const icon = (name, cls = "") => `<svg class="ico ${cls}" viewBox="0 0 24 24" aria-hidden="true">${ICON_PATHS[name] || ""}</svg>`;
 
 // ---------- утилиты ----------
 
-const esc = (s) =>
-  String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
-const money = (n) => `${Number(n || 0).toLocaleString("ru-RU")} ${state.settings.currency}`;
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+const num = (n) => Number(n || 0).toLocaleString("ru-RU");
+const money = (n) => `${num(n)} ${state.settings.currency}`;
 const photoUrl = (id) => `${API}/api/photo/${encodeURIComponent(id)}`;
 const stockOf = (p) => p.sizes.reduce((s, x) => s + x.stock, 0);
 const can = (v) => tg && tg.isVersionAtLeast && tg.isVersionAtLeast(v);
@@ -83,13 +100,30 @@ const plural = (n, one, few, many) => {
   const m10 = n % 10, m100 = n % 100;
   return m10 === 1 && m100 !== 11 ? one : m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14) ? few : many;
 };
+const debounce = (fn, ms) => {
+  let t;
+  return (...a) => (clearTimeout(t), (t = setTimeout(() => fn(...a), ms)));
+};
+
+function loadJSON(key, fallback) {
+  try {
+    return JSON.parse(localStorage.getItem(key)) || fallback;
+  } catch (_) {
+    return fallback;
+  }
+}
+function saveJSON(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch (_) {}
+}
 
 function haptic(type) {
   try {
     if (!can("6.1")) return;
     if (type === "ok" || type === "error") tg.HapticFeedback.notificationOccurred(type === "ok" ? "success" : "error");
     else if (type === "select") tg.HapticFeedback.selectionChanged();
-    else tg.HapticFeedback.impactOccurred("light");
+    else tg.HapticFeedback.impactOccurred(type || "light");
   } catch (_) {}
 }
 
@@ -98,7 +132,7 @@ function toast(text, isError) {
   $toast.innerHTML = `${icon(isError ? "xCircle" : "checkCircle")}<span>${esc(text)}</span>`;
   $toast.className = "toast show" + (isError ? " err" : "");
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => ($toast.className = "toast"), 2400);
+  toastTimer = setTimeout(() => ($toast.className = "toast"), 2600);
   haptic(isError ? "error" : "ok");
 }
 
@@ -109,17 +143,8 @@ function confirmDialog(text) {
   });
 }
 
-function loadCart() {
-  try {
-    return JSON.parse(localStorage.getItem("dayz_cart") || "[]");
-  } catch (_) {
-    return [];
-  }
-}
 function saveCart() {
-  try {
-    localStorage.setItem("dayz_cart", JSON.stringify(state.cart));
-  } catch (_) {}
+  saveJSON("dayz_cart", state.cart);
   renderNav();
 }
 const cartCount = () => state.cart.reduce((s, i) => s + i.qty, 0);
@@ -176,28 +201,23 @@ function pickFile(accept, multiple) {
   });
 }
 
-function copy(text) {
+function copy(text, label = "Скопировано") {
   (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject())
-    .then(() => toast("Скопировано"))
+    .then(() => toast(label))
     .catch(() => toast("Не удалось скопировать", true));
 }
 
 function openLink(url) {
-  if (tg && tg.openLink) tg.openLink(url);
+  if (url.startsWith("https://t.me/") && tg && tg.openTelegramLink) tg.openTelegramLink(url);
+  else if (tg && tg.openLink) tg.openLink(url);
   else window.open(url, "_blank");
 }
 
 // Поддержка — чат с админами через бота (бот пересылает сообщение обоим админам)
-function supportUrl() {
-  return state.botUsername ? `https://t.me/${state.botUsername}?start=support` : null;
-}
 function openSupport() {
-  const url = supportUrl();
-  if (!url) return;
-  if (tg && tg.openTelegramLink) {
-    tg.openTelegramLink(url);
-    tg.close();
-  } else openLink(url);
+  if (!state.botUsername) return;
+  openLink(`https://t.me/${state.botUsername}?start=support`);
+  if (tg && tg.close) setTimeout(() => tg.close(), 300);
 }
 
 // ---------- кусочки разметки ----------
@@ -205,10 +225,11 @@ function openSupport() {
 const loaderHtml = (text = "Загрузка") => `<div class="loader"><div class="spin"></div><div class="slow">${text}</div></div>`;
 const photoHtml = (id) => (id ? `<img src="${photoUrl(id)}" loading="lazy" alt="">` : `<div class="placeholder"><img src="assets/logo.jpg" alt=""></div>`);
 const statusPill = (s) => `<span class="status st-${s}">${STATUS[s] || s}</span>`;
-const title = (text) => `<h1 class="large-title">${esc(text)}</h1>`;
-const header = (text) => `<div class="section-header">${esc(text)}</div>`;
+const title = (text) => FX.maskedHeading(text);
+const header = (text, right = "") => `<div class="section-header${right ? " row" : ""}"><span>${esc(text)}</span>${right}</div>`;
 const footer = (text) => `<div class="section-footer">${text}</div>`;
-const kv = (k, v) => `<div class="cell kv"><span class="title">${esc(k)}</span><span class="value">${v}</span></div>`;
+const kv = (k, v, cls = "") => `<div class="cell kv ${cls}"><span class="title">${esc(k)}</span><span class="value">${v}</span></div>`;
+const chev = () => icon("chevronRight", "chev");
 
 function emptyHtml(ico, head, text, button) {
   return `<div class="empty"><div class="e-ico">${icon(ico, "lg")}</div><b>${esc(head)}</b>${text ? `<p>${esc(text)}</p>` : ""}${
@@ -216,11 +237,51 @@ function emptyHtml(ico, head, text, button) {
   }</div>`;
 }
 
+function rseg(options, active, id) {
+  return `<div class="rseg" id="${id}"><span class="rseg-thumb"></span>${options
+    .map(([v, l]) => `<button type="button" data-v="${esc(v)}" class="${String(v) === String(active) ? "active" : ""}">${esc(l)}</button>`)
+    .join("")}</div>`;
+}
+
+function heartBtn(p, big) {
+  return `<button class="heart ${big ? "big" : ""}" data-heart="${p.id}" aria-label="В избранное">${HEART_SVG}${big ? '<span class="heart-count"></span>' : ""}</button>`;
+}
+
+function bindHearts(root = $view) {
+  root.querySelectorAll("[data-heart]").forEach((btn) => {
+    const id = +btn.dataset.heart;
+    const product = state.products.find((p) => p.id === id);
+    FX.pulseHeart(btn, {
+      liked: state.favorites.has(id),
+      count: product ? product.likes : 0,
+      onToggle: async () => {
+        haptic("medium");
+        const res = await api(`/api/favorites/${id}`, { method: "POST" });
+        res.favorite ? state.favorites.add(id) : state.favorites.delete(id);
+        if (product) product.likes = res.likes;
+        return res;
+      },
+    });
+  });
+}
+
+function badgeTag(p) {
+  if (p.badge === "soon") return '<span class="tag soon">Скоро</span>';
+  if (p.old_price) return `<span class="tag sale">−${Math.round((1 - p.price / p.old_price) * 100)}%</span>`;
+  if (p.badge === "new") return '<span class="tag new">New</span>';
+  if (p.badge === "hit") return '<span class="tag hit">Хит</span>';
+  if (!stockOf(p)) return '<span class="tag">Нет в наличии</span>';
+  return "";
+}
+
+const priceHtml = (p) => `<span>${money(p.price)}</span>${p.old_price ? `<span class="old">${money(p.old_price)}</span>` : ""}`;
+
 const STATUS_INFO = {
-  awaiting_payment: ["card", "c-orange", "Ждём оплату", "Переведи сумму по реквизитам ниже и загрузи чек."],
+  awaiting_payment: ["card", "c-orange", "Ждём оплату", "Переведи сумму на карту ниже и загрузи чек."],
   checking: ["clock", "c-blue", "Проверяем оплату", "Чек получен. Как только подтвердим поступление — бот пришлёт сообщение."],
+  confirmed: ["cash", "c-yellow", "Заказ подтверждён", "Оплатишь наличными при получении. Мы свяжемся, чтобы договориться о времени."],
   paid: ["checkCircle", "c-green", "Оплата подтверждена", "Собираем заказ и скоро отправим. Трек-номер придёт в бота."],
-  shipped: ["truck", "c-purple", "Заказ в пути", "Трек-номер указан ниже."],
+  shipped: ["truck", "c-purple", "Заказ в пути", "Скоро будет у тебя."],
   done: ["box", "c-gray", "Заказ получен", "Спасибо, что выбрал DAYZ DROP."],
   cancelled: ["xCircle", "c-red", "Заказ отменён", "Если это ошибка — напиши в поддержку."],
 };
@@ -230,9 +291,12 @@ function statusCard(status) {
   return `<div class="status-card"><div class="t-ico ${color}">${icon(ico)}</div><div><b>${head}</b><p>${text}</p></div></div>`;
 }
 
-// ---------- навигация ----------
+// ---------- навигация: у каждой вкладки свой стек экранов ----------
 
 const screens = {};
+const TITLES = {
+  product: "Товар", checkout: "Оформление", order: "Заказ", favorites: "Избранное", pointsHistory: "История баллов",
+};
 
 function setBar(html) {
   document.querySelectorAll(".bar").forEach((b) => b.remove());
@@ -245,136 +309,174 @@ function setBar(html) {
   return bar;
 }
 
+const stack = () => state.stacks[state.tab];
+const currentScreen = () => stack()[stack().length - 1];
+
 async function render() {
-  const top = state.stack[state.stack.length - 1];
+  const screen = currentScreen();
+  const nested = stack().length > 1;
   setBar(null);
   window.scrollTo(0, 0);
-  const canGoBack = state.stack.length > 1;
-  if (can("6.1")) canGoBack ? tg.BackButton.show() : tg.BackButton.hide();
+  if (can("6.1")) nested ? tg.BackButton.show() : tg.BackButton.hide();
   try {
-    await screens[top.name](top.params || {});
+    await screens[screen.name](screen.params || {});
   } catch (err) {
     $view.innerHTML = emptyHtml("warning", "Что-то пошло не так", err.message, "Повторить");
     document.getElementById("emptyBtn").onclick = render;
   }
-  if (canGoBack && !can("6.1")) {
-    $view.insertAdjacentHTML("afterbegin", `<button class="back" id="backBtn">${icon("chevronLeft")}Назад</button>`);
+  if (nested && currentScreen() === screen) {
+    const name = (screen.params && screen.params.title) || TITLES[screen.name] || "";
+    $view.insertAdjacentHTML("afterbegin", `<div class="topbar"><button class="back-btn" id="backBtn">${icon("chevronLeft")}Назад</button><div class="tb-title">${esc(name)}</div></div>`);
     document.getElementById("backBtn").onclick = back;
   }
+  bindHearts();
 }
 
 function go(name, params) {
   haptic();
-  state.stack.push({ name, params });
+  stack().push({ name, params });
   render();
 }
 
 function back() {
-  if (state.stack.length > 1) state.stack.pop();
+  haptic();
+  if (stack().length > 1) stack().pop();
   render();
 }
 
 function switchTab(tab) {
+  haptic("select");
+  if (state.tab === tab) state.stacks[tab] = [state.stacks[tab][0]]; // повторное нажатие — в корень вкладки
   state.tab = tab;
-  state.stack = [{ name: tab }];
   renderNav();
   render();
 }
 
 function renderNav() {
-  const tabs = [
-    ["catalog", "Каталог", "bag"],
-    ["cart", "Корзина", "cart"],
-    ["orders", "Заказы", "box"],
-  ];
-  if (state.isAdmin) tabs.push(["admin", "Управление", "sliders"]);
+  const tabs = [["catalog", "Каталог", "bag"], ["cart", "Корзина", "cart"], ["orders", "Заказы", "box"], ["profile", "Профиль", "user"]];
+  if (state.isAdmin) tabs.push(["admin", "Админ", "sliders"]);
   const count = cartCount();
-  $nav.innerHTML = tabs
-    .map(
-      ([id, label, ico]) =>
-        `<button data-tab="${id}" class="${state.tab === id ? "active" : ""}">${icon(ico)}${label}${
-          id === "cart" && count ? `<span class="badge">${count}</span>` : ""
-        }</button>`
-    )
-    .join("");
-  $nav.querySelectorAll("button").forEach((b) => (b.onclick = () => (haptic("select"), switchTab(b.dataset.tab))));
+  $nav.innerHTML =
+    '<span class="pill-ind"></span>' +
+    tabs.map(([id, label, ico]) => `<button data-tab="${id}" class="${state.tab === id ? "active" : ""}">${icon(ico)}${label}${id === "cart" && count ? `<span class="badge">${count}</span>` : ""}</button>`).join("");
+  $nav.querySelectorAll("button").forEach((b) => (b.onclick = () => switchTab(b.dataset.tab)));
+  requestAnimationFrame(() => FX.pillNav($nav));
 }
 
 // ---------- каталог ----------
 
-async function loadProducts() {
-  state.products = await api("/api/products");
+async function loadProducts(force) {
+  if (force || !state.products.length) state.products = await api("/api/products");
 }
 
 screens.catalog = async () => {
   if (!state.products.length) {
-    $view.innerHTML = loaderHtml();
+    $view.innerHTML = loaderHtml("Загружаем DAYZ DROP");
     await loadProducts();
   }
   const cats = ["Все", ...new Set(state.products.map((p) => p.category).filter(Boolean))];
   if (!cats.includes(state.category)) state.category = "Все";
-  const list = state.products.filter((p) => state.category === "Все" || p.category === state.category);
+  let list = state.products.filter((p) => state.category === "Все" || p.category === state.category);
+  if (state.sort === "cheap") list = [...list].sort((a, b) => a.price - b.price);
+  if (state.sort === "expensive") list = [...list].sort((a, b) => b.price - a.price);
+  const fresh = state.products.filter((p) => p.badge === "new" || p.badge === "hit").concat(state.products.filter((p) => !p.badge)).filter((p) => p.photos.length).slice(0, 7);
+  const words = cats.length > 1 ? cats.slice(1).map((c) => c.toLowerCase()) : ["худи", "футболки", "карго", "дропы"];
 
   $view.innerHTML = `
-    <div class="hero"><img src="assets/logo-banner.jpg" alt="DAYZ DROP"></div>
+    <section class="hero">${FX.lightPillar()}
+      <img class="logo" src="assets/logo-banner.jpg" alt="DAYZ DROP">
+      <div class="tagline">Новый дроп <span class="rt" id="rt"></span></div>
+    </section>
+    ${fresh.length >= 2 ? `${header("Новинки")}<div class="dc" id="dc">${fresh.map((p) => `
+      <div class="dc-card" data-id="${p.id}">${photoHtml(p.photos[0])}${badgeTag(p)}
+        <div class="dc-info"><b>${esc(p.title)}</b><span>${money(p.price)}</span></div></div>`).join("")}</div><div class="dc-dots" id="dcDots"></div>` : ""}
     ${title("Каталог")}
     ${cats.length > 2 ? `<div class="pills">${cats.map((c) => `<button class="pill ${c === state.category ? "active" : ""}" data-cat="${esc(c)}">${esc(c)}</button>`).join("")}</div>` : ""}
-    ${
-      list.length
-        ? `<div class="grid">${list
-            .map(
-              (p) => `
-          <button class="card" data-id="${p.id}">
-            <div class="card-img">${photoHtml(p.photos[0])}${stockOf(p) ? "" : '<span class="tag">Нет в наличии</span>'}</div>
-            <div class="card-title">${esc(p.title)}</div>
-            <div class="card-price">${money(p.price)}</div>
-          </button>`
-            )
-            .join("")}</div>`
-        : emptyHtml("hanger", "Скоро здесь появятся вещи", "Загляни чуть позже — готовим новый дроп.")
-    }`;
+    ${list.length > 1 ? rseg([["new", "Новые"], ["cheap", "Дешевле"], ["expensive", "Дороже"]], state.sort, "sort") : ""}
+    ${list.length
+      ? `<div class="grid" style="margin-top:12px">${list.map((p) => `
+        <div class="card" data-id="${p.id}">
+          <div class="card-img spot">${photoHtml(p.photos[0])}${badgeTag(p)}${heartBtn(p)}</div>
+          <div class="card-title">${esc(p.title)}</div>
+          <div class="card-price">${priceHtml(p)}</div>
+          ${p.rating ? `<div class="rating-mini">★ ${p.rating} <span style="color:var(--label-3)">(${p.rating_count})</span></div>` : ""}
+        </div>`).join("")}</div>`
+      : emptyHtml("hanger", "Скоро здесь появятся вещи", "Загляни чуть позже — готовим новый дроп.")}`;
+
+  FX.rotatingText(document.getElementById("rt"), words);
+  const dc = document.getElementById("dc");
+  if (dc) {
+    dc.appendChild(document.getElementById("dcDots")).classList.add("dc-dots");
+    FX.depthCarousel(dc, { onOpen: (id) => go("product", { id: +id }) });
+  }
   $view.querySelectorAll("[data-cat]").forEach((b) => (b.onclick = () => ((state.category = b.dataset.cat), haptic("select"), render())));
-  $view.querySelectorAll(".card").forEach((b) => (b.onclick = () => go("product", { id: +b.dataset.id })));
+  const sort = document.getElementById("sort");
+  if (sort) FX.rubberSegment(sort, (v) => ((state.sort = v), haptic("select"), setTimeout(render, 380)));
+  $view.querySelectorAll(".card").forEach((c) => (c.onclick = (e) => !e.target.closest(".heart") && go("product", { id: +c.dataset.id })));
 };
 
 screens.product = async ({ id }) => {
+  await loadProducts();
   const p = state.products.find((x) => x.id === id);
-  if (!p) throw new Error("Товар не найден");
+  if (!p) throw new Error("Товар больше недоступен");
+  const soon = p.badge === "soon";
   const available = p.sizes.filter((s) => s.stock > 0);
-  let size = available.length === 1 ? available[0].size : null;
-
+  let size = available.length === 1 && !soon ? available[0].size : null;
   const photos = p.photos.length ? p.photos : [null];
+
   $view.innerHTML = `
     <div class="gallery" id="gallery">${photos.map((ph) => `<div>${photoHtml(ph)}</div>`).join("")}</div>
     ${photos.length > 1 ? `<div class="dots" id="dots">${photos.map((_, i) => `<i class="${i ? "" : "on"}"></i>`).join("")}</div>` : ""}
-    ${p.category ? `<div class="p-cat">${esc(p.category)}</div>` : ""}
-    <h1 class="p-title" ${p.category ? "" : 'style="margin-top:18px"'}>${esc(p.title)}</h1>
-    <div class="p-price">${money(p.price)}</div>
-    <div class="section-header" style="margin-left:0">Размер</div>
-    <div class="sizes">${p.sizes
-      .map((s) => `<button class="size" data-size="${esc(s.size)}" ${s.stock ? "" : "disabled"}>${esc(s.size)}${s.stock && s.stock <= 3 ? `<small>осталось ${s.stock}</small>` : ""}</button>`)
-      .join("")}</div>
-    ${p.description ? `<div class="section-header" style="margin-left:0">Описание</div><div class="p-desc">${esc(p.description)}</div>` : ""}`;
+    <div class="p-head">
+      <div class="grow">
+        <div class="p-cat">${esc(p.category || "DAYZ DROP")} ${badgeTag(p)}</div>
+        <div class="p-title">${esc(p.title)}</div>
+        <div class="p-price">${priceHtml(p)}</div>
+        ${p.rating ? `<div class="rating-mini" style="font-size:14px;margin-top:6px">★ ${p.rating} · ${p.rating_count} ${plural(p.rating_count, "оценка", "оценки", "оценок")}</div>` : ""}
+      </div>
+      ${heartBtn(p, true)}
+    </div>
+    ${soon ? "" : `${header("Размер")}<div class="sizes">${p.sizes.map((s) => `<button class="size ${s.stock ? "" : "empty"}" data-size="${esc(s.size)}">${esc(s.size)}${s.stock ? (s.stock <= 3 ? `<small>осталось ${s.stock}</small>` : "") : "<small>нет</small>"}</button>`).join("")}</div>`}
+    <div id="bellWrap" style="margin-top:14px"></div>
+    ${p.size_chart ? `<div style="margin-top:20px"><details class="chart"><summary>Замеры по размерам ${icon("chevronRight")}</summary><pre>${esc(p.size_chart)}</pre></details></div>` : ""}
+    ${p.description ? `${header("Описание")}<div class="p-desc">${esc(p.description)}</div>` : ""}`;
 
   const gallery = document.getElementById("gallery");
   const dots = document.getElementById("dots");
-  if (dots)
-    gallery.onscroll = () => {
-      const i = Math.round(gallery.scrollLeft / gallery.clientWidth);
-      [...dots.children].forEach((d, j) => d.classList.toggle("on", i === j));
-    };
+  if (dots) gallery.onscroll = () => {
+    const i = Math.round(gallery.scrollLeft / gallery.clientWidth);
+    [...dots.children].forEach((d, j) => d.classList.toggle("on", i === j));
+  };
 
-  const addBtn = setBar(`<button class="btn" id="addBtn"></button>`).querySelector("#addBtn");
+  const bellWrap = document.getElementById("bellWrap");
+  const showBell = (sz) => {
+    const key = `${p.id}:${sz}`;
+    bellWrap.innerHTML = `<button class="bell-toggle" id="bell">${icon("bell")}<span class="bt-labels"><span class="bt-off">${
+      sz === "*" ? "Сообщить о старте продаж" : `Сообщить, когда появится ${esc(sz)}`}</span><span class="bt-on">Напишем в бота первым делом</span></span></button>`;
+    FX.bellToggle(document.getElementById("bell"), state.subs.has(key), async (on) => {
+      haptic("medium");
+      await api("/api/subscribe", { method: "POST", body: { product_id: p.id, size: sz, on } });
+      on ? state.subs.add(key) : state.subs.delete(key);
+      toast(on ? "Подписка оформлена" : "Подписка снята");
+    });
+  };
+
+  const addBtn = soon ? null : setBar(`<button class="btn" id="addBtn"></button>`).querySelector("#addBtn");
   const refresh = () => {
     $view.querySelectorAll(".size").forEach((b) => b.classList.toggle("active", b.dataset.size === size));
+    const entry = p.sizes.find((s) => s.size === size);
+    if (soon) return showBell("*");
+    if (entry && !entry.stock) showBell(size);
+    else bellWrap.innerHTML = "";
     const inCart = state.cart.find((i) => i.product_id === p.id && i.size === size);
-    addBtn.disabled = !stockOf(p) || !size;
+    addBtn.disabled = !entry || !entry.stock;
     if (!stockOf(p)) addBtn.textContent = "Нет в наличии";
     else if (!size) addBtn.textContent = "Выбери размер";
+    else if (!entry.stock) addBtn.textContent = "Этого размера нет";
     else addBtn.innerHTML = inCart ? `${icon("check")} В корзине · ${inCart.qty} шт` : `Добавить в корзину · ${money(p.price)}`;
   };
   $view.querySelectorAll(".size").forEach((b) => (b.onclick = () => ((size = b.dataset.size), haptic("select"), refresh())));
-  addBtn.onclick = () => {
+  if (addBtn) addBtn.onclick = () => {
     const stock = p.sizes.find((s) => s.size === size).stock;
     const item = state.cart.find((i) => i.product_id === p.id && i.size === size);
     if ((item ? item.qty : 0) >= stock) return toast(`Больше нет в наличии — всего ${stock} шт`, true);
@@ -387,6 +489,17 @@ screens.product = async ({ id }) => {
   refresh();
 };
 
+screens.favorites = async () => {
+  await loadProducts(true);
+  const list = state.products.filter((p) => state.favorites.has(p.id));
+  $view.innerHTML = list.length
+    ? `<div class="grid" style="margin-top:8px">${list.map((p) => `
+      <div class="card" data-id="${p.id}"><div class="card-img spot">${photoHtml(p.photos[0])}${badgeTag(p)}${heartBtn(p)}</div>
+      <div class="card-title">${esc(p.title)}</div><div class="card-price">${priceHtml(p)}</div></div>`).join("")}</div>`
+    : emptyHtml("star", "Пока пусто", "Нажимай на сердечко у вещей — они соберутся здесь.");
+  $view.querySelectorAll(".card").forEach((c) => (c.onclick = (e) => !e.target.closest(".heart") && go("product", { id: +c.dataset.id })));
+};
+
 // ---------- корзина и оформление ----------
 
 function cartLines() {
@@ -396,47 +509,38 @@ function cartLines() {
       const s = p && p.sizes.find((x) => x.size === i.size);
       return { ...i, product: p, stock: s ? s.stock : 0 };
     })
-    .filter((l) => l.product);
+    .filter((l) => l.product && l.product.badge !== "soon");
 }
 
 screens.cart = async () => {
   $view.innerHTML = loaderHtml();
-  await loadProducts();
-  // Убираем то, чего больше нет, и подрезаем количество под остаток
-  state.cart = cartLines()
-    .filter((l) => l.stock > 0)
-    .map((l) => ({ product_id: l.product_id, size: l.size, qty: Math.min(l.qty, l.stock) }));
+  await loadProducts(true);
+  state.cart = cartLines().filter((l) => l.stock > 0).map((l) => ({ product_id: l.product_id, size: l.size, qty: Math.min(l.qty, l.stock) }));
   saveCart();
-
   const lines = cartLines();
   if (!lines.length) {
     $view.innerHTML = title("Корзина") + emptyHtml("cart", "Корзина пуста", "Добавь вещи из каталога — они появятся здесь.", "Перейти в каталог");
     document.getElementById("emptyBtn").onclick = () => switchTab("catalog");
     return;
   }
-  const total = lines.reduce((s, l) => s + l.product.price * l.qty, 0);
+  const subtotal = lines.reduce((s, l) => s + l.product.price * l.qty, 0);
   const units = lines.reduce((s, l) => s + l.qty, 0);
   $view.innerHTML = `
     ${title("Корзина")}
-    <div class="group">${lines
-      .map(
-        (l, idx) => `
+    <div class="group">${lines.map((l, idx) => `
       <div class="cell has-thumb">
         <div class="thumb">${photoHtml(l.product.photos[0])}</div>
         <div class="grow">
           <div class="title">${esc(l.product.title)}</div>
           <div class="sub">Размер ${esc(l.size)} · ${money(l.product.price)}</div>
-          <div style="margin-top:8px" class="stepper"><button data-dec="${idx}" aria-label="Меньше">${icon(l.qty > 1 ? "minus" : "trash")}</button><span class="div"></span><span>${l.qty}</span><span class="div"></span><button data-inc="${idx}" aria-label="Больше">${icon("plus")}</button></div>
+          <div style="margin-top:8px" class="stepper"><button data-dec="${idx}" aria-label="Меньше">${icon(l.qty > 1 ? "minus" : "trash")}</button><span>${l.qty}</span><button data-inc="${idx}" aria-label="Больше">${icon("plus")}</button></div>
         </div>
-      </div>`
-      )
-      .join("")}</div>
+      </div>`).join("")}</div>
     <div class="group" style="margin-top:20px">
-      ${kv(`${units} ${plural(units, "товар", "товара", "товаров")}`, money(total))}
-      ${kv("Доставка", "по тарифу службы")}
-      <div class="cell total"><span class="title">Итого</span><span class="value" style="flex:1">${money(total)}</span></div>
-    </div>`;
-
+      ${kv(`${units} ${plural(units, "вещь", "вещи", "вещей")}`, money(subtotal))}
+      ${kv("Доставка", "на следующем шаге")}
+    </div>
+    ${state.me.registered && state.settings.loyalty_enabled ? footer(`За этот заказ начислим около ${num(Math.floor(subtotal * state.settings.earn_percent / 100))} баллов.`) : ""}`;
   const change = (idx, delta) => {
     const l = lines[idx];
     const item = state.cart.find((i) => i.product_id === l.product_id && i.size === l.size);
@@ -449,81 +553,162 @@ screens.cart = async () => {
   };
   $view.querySelectorAll("[data-inc]").forEach((b) => (b.onclick = () => change(+b.dataset.inc, 1)));
   $view.querySelectorAll("[data-dec]").forEach((b) => (b.onclick = () => change(+b.dataset.dec, -1)));
-  setBar(`<button class="btn" id="checkout">Оформить заказ</button>`).querySelector("#checkout").onclick = () => go("checkout");
+  setBar(`<button class="btn" id="checkout">Оформить · ${money(subtotal)}</button>`).querySelector("#checkout").onclick = () => go("checkout");
 };
 
 screens.checkout = async () => {
+  await loadProducts();
   const lines = cartLines();
-  const total = lines.reduce((s, l) => s + l.product.price * l.qty, 0);
-  const opts = state.settings.delivery_options;
-  let saved = {};
-  try {
-    saved = JSON.parse(localStorage.getItem("dayz_customer") || "{}");
-  } catch (_) {}
+  if (!lines.length) return switchTab("cart");
+  const methods = state.settings.delivery_methods;
+  const saved = loadJSON("dayz_customer", {});
   const user = (tg && tg.initDataUnsafe && tg.initDataUnsafe.user) || {};
-  let delivery = opts.includes(saved.delivery) ? saved.delivery : opts[0];
+  const ck = state.checkout;
+  if (!methods.some((m) => m.id === ck.delivery)) ck.delivery = (methods.find((m) => m.id === saved.delivery) || methods[0]).id;
+  let profile = null;
+  try {
+    profile = state.me.registered ? await api("/api/profile") : null;
+  } catch (_) {}
+  const myCoupons = profile ? profile.coupons.filter((c) => !c.spent) : [];
+  const name = saved.customer_name || state.me.full_name || [user.first_name, user.last_name].filter(Boolean).join(" ");
+  const phone = saved.phone || state.me.phone || "";
 
   $view.innerHTML = `
-    ${title("Оформление")}
     <form id="form" onsubmit="return false">
       ${header("Получатель")}
       <div class="group">
-        <div class="cell field"><label for="f_name">Имя и фамилия</label><input class="input" id="f_name" name="customer_name" required autocomplete="name" value="${esc(saved.customer_name || [user.first_name, user.last_name].filter(Boolean).join(" "))}"></div>
-        <div class="cell field"><label for="f_phone">Телефон</label><input class="input" id="f_phone" name="phone" type="tel" required autocomplete="tel" value="${esc(saved.phone || "")}" placeholder="+7 900 000-00-00"></div>
+        <div class="cell field"><label for="f_name">Имя и фамилия</label><input class="input" id="f_name" name="customer_name" required autocomplete="name" value="${esc(name)}"></div>
+        <div class="cell field"><label for="f_phone">Телефон</label><input class="input" id="f_phone" name="phone" type="tel" required autocomplete="tel" value="${esc(phone)}" placeholder="+998 90 123 45 67"></div>
       </div>
       ${header("Доставка")}
-      <div class="group" id="delivery">${opts
-        .map((o) => `<button type="button" class="cell tap" data-d="${esc(o)}"><span class="grow title">${esc(o)}</span><span class="check-ico">${icon("check")}</span></button>`)
-        .join("")}</div>
-      <div id="addrBlock">
-        ${header("Адрес")}
-        <div class="group"><div class="cell field"><label for="f_addr">Город, адрес или пункт выдачи</label><textarea class="input" id="f_addr" name="address" rows="2">${esc(saved.address || "")}</textarea></div></div>
+      <div class="group">${methods.map((m) => `
+        <button type="button" class="cell tap" data-d="${esc(m.id)}">
+          <div class="grow"><div class="title">${esc(m.name)}</div><div class="sub" data-dprice="${esc(m.id)}"></div></div>
+          <span class="check-ico">${icon("check")}</span></button>`).join("")}</div>
+      <div id="addrBlock">${header("Адрес")}
+        <div class="group"><div class="cell field"><label for="f_addr">Город, улица, дом, ориентир</label><textarea class="input" id="f_addr" name="address" rows="2">${esc(saved.address || "")}</textarea></div></div>
       </div>
+      ${header("Оплата")}
+      <div id="payBlock"></div>
+      ${header("Промокод или купон")}
+      <div class="group">
+        <div class="codeslots" id="codeslots"><div class="slots"></div><input id="f_coupon" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" aria-label="Промокод" value="${esc(ck.coupon)}"></div>
+        <div id="couponState"></div>
+      </div>
+      ${myCoupons.length ? `<div class="pills" style="margin-top:10px">${myCoupons.map((c) => `<button type="button" class="pill" data-coupon="${esc(c.code)}">${icon("ticket")} ${esc(c.code)} · ${esc(c.label)}</button>`).join("")}</div>` : ""}
       ${header("Комментарий")}
       <div class="group"><div class="cell"><input class="input" name="comment" placeholder="Необязательно"></div></div>
     </form>
-    ${header("Заказ")}
-    <div class="group">
-      ${lines.map((l) => kv(`${l.product.title} · ${l.size} × ${l.qty}`, money(l.product.price * l.qty))).join("")}
-      <div class="cell total"><span class="title">Итого</span><span class="value" style="flex:1">${money(total)}</span></div>
-    </div>
-    ${footer("После оформления бот пришлёт реквизиты для перевода. Оплату проверяем вручную по чеку.")}`;
+    ${header("Итого")}
+    <div class="group" id="totals">${loaderHtml("Считаем")}</div>
+    <div id="pointsNote"></div>`;
 
   const form = document.getElementById("form");
   const addrBlock = document.getElementById("addrBlock");
-  const refresh = () => {
-    $view.querySelectorAll("[data-d]").forEach((b) => (b.querySelector(".check-ico").style.visibility = b.dataset.d === delivery ? "visible" : "hidden"));
-    addrBlock.style.display = /самовывоз/i.test(delivery || "") ? "none" : "";
-  };
-  $view.querySelectorAll("[data-d]").forEach((b) => (b.onclick = () => ((delivery = b.dataset.d), haptic("select"), refresh())));
-  refresh();
+  const payBlock = document.getElementById("payBlock");
+  let quote = null;
+  let busy = false;
 
-  const btn = setBar(`<button class="btn" id="submit">Подтвердить · ${money(total)}</button>`).querySelector("#submit");
-  btn.onclick = async () => {
-    if (!form.reportValidity()) return;
+  const renderPayments = () => {
+    const opts = [["card", "Картой"], ["cash", "Наличными"]].filter(([k]) => quote && quote.payments[k]);
+    if (!opts.length) {
+      payBlock.innerHTML = `<div class="group"><div class="cell"><span class="sub" style="margin:0">Для этой доставки сейчас нет доступной оплаты — напиши в поддержку.</span></div></div>`;
+      return;
+    }
+    if (!opts.some(([k]) => k === ck.payment)) ck.payment = opts[0][0];
+    const method = methods.find((m) => m.id === ck.delivery);
+    const hint = ck.payment === "card"
+      ? `Переводишь на карту после оформления и присылаешь чек. Вещи держим ${state.settings.cancel_hours || 24} ч.`
+      : "Платишь наличными, когда забираешь заказ или курьеру.";
+    const why = !quote.payments.cash ? (method && !method.cash ? "Для этой доставки — только предоплата картой." : "Для тебя доступна только предоплата картой.") : "";
+    payBlock.innerHTML = (opts.length > 1 ? rseg(opts, ck.payment, "payseg") : `<div class="group"><div class="cell">${icon(opts[0][0] === "card" ? "card" : "cash")}<span class="grow title">${opts[0][1]}</span></div></div>`) +
+      footer(esc(why ? `${why} ${hint}` : hint));
+    const seg = document.getElementById("payseg");
+    if (seg) FX.rubberSegment(seg, (v) => ((ck.payment = v), haptic("select"), recalc()));
+  };
+
+  const renderTotals = () => {
+    const t = document.getElementById("totals");
+    if (!quote) return;
+    t.innerHTML = `
+      ${kv("Товары", money(quote.subtotal))}
+      ${quote.discount ? kv(`Скидка · ${quote.coupon}`, `−${money(quote.discount)}`, "minus") : ""}
+      ${kv("Доставка", quote.delivery_price ? money(quote.delivery_price) : "бесплатно")}
+      <div class="cell total"><span class="title">Итого</span><span class="value" style="flex:1">${money(quote.total)}</span></div>`;
+    const note = document.getElementById("pointsNote");
+    if (state.settings.loyalty_enabled && quote.earn_points) {
+      note.innerHTML = quote.registered
+        ? footer(`${icon("gift")} После получения начислим <b>${num(quote.earn_points)}</b> баллов.`)
+        : footer(`Зарегистрируйся в профиле — получишь ${num(state.settings.welcome_points)} баллов сразу и ${num(quote.earn_points)} за этот заказ.`);
+    } else note.innerHTML = "";
+    const cs = document.getElementById("couponState");
+    cs.innerHTML = quote.coupon
+      ? `<div class="coupon-ok">${icon("checkCircle")} ${esc(quote.coupon_title || "Промокод применён")} · −${money(quote.discount)}</div>`
+      : quote.coupon_error ? `<div class="coupon-ok" style="color:var(--red)">${icon("xCircle")} ${esc(quote.coupon_error)}</div>` : "";
+    submit.innerHTML = `Подтвердить · ${money(quote.total)}`;
+    submit.disabled = !quote.payments[ck.payment];
+  };
+
+  const recalc = async () => {
+    try {
+      quote = await api("/api/quote", { method: "POST", body: { items: state.cart, delivery: ck.delivery, payment: ck.payment, coupon: ck.coupon } });
+    } catch (err) {
+      toast(err.message, true);
+      return;
+    }
+    methods.forEach((m) => {
+      const el = $view.querySelector(`[data-dprice="${m.id}"]`);
+      const cost = m.free_from && quote.subtotal >= m.free_from ? 0 : m.price;
+      const extra = [m.note, !m.cash ? "только предоплата" : "", m.free_from && cost ? `бесплатно от ${money(m.free_from)}` : ""].filter(Boolean).join(" · ");
+      if (el) el.innerHTML = `${cost ? money(cost) : "бесплатно"}${extra ? " · " + esc(extra) : ""}`;
+    });
+    renderPayments();
+    renderTotals();
+  };
+
+  const refreshDelivery = () => {
+    $view.querySelectorAll("[data-d]").forEach((b) => (b.querySelector(".check-ico").style.visibility = b.dataset.d === ck.delivery ? "visible" : "hidden"));
+    const method = methods.find((m) => m.id === ck.delivery);
+    addrBlock.style.display = method && method.address ? "" : "none";
+  };
+  $view.querySelectorAll("[data-d]").forEach((b) => (b.onclick = () => ((ck.delivery = b.dataset.d), haptic("select"), refreshDelivery(), recalc())));
+  refreshDelivery();
+
+  const slots = FX.codeSlots(document.getElementById("codeslots"), {
+    onChange: debounce((v) => {
+      if (!v || v.length >= 4) (ck.coupon = v), recalc();
+    }, 500),
+  });
+  $view.querySelectorAll("[data-coupon]").forEach((b) => (b.onclick = () => (slots.set(b.dataset.coupon), (ck.coupon = b.dataset.coupon), haptic("select"), recalc())));
+
+  const submit = setBar(`<button class="btn" id="submit">Подтвердить</button>`).querySelector("#submit");
+  submit.onclick = async () => {
+    if (busy || !form.reportValidity()) return;
     const data = Object.fromEntries(new FormData(form));
-    data.delivery = delivery;
+    saveJSON("dayz_customer", { customer_name: data.customer_name, phone: data.phone, address: data.address, delivery: ck.delivery });
+    busy = true;
+    submit.disabled = true;
+    submit.textContent = "Оформляем…";
     try {
-      localStorage.setItem("dayz_customer", JSON.stringify({ customer_name: data.customer_name, phone: data.phone, address: data.address, delivery }));
-    } catch (_) {}
-    btn.disabled = true;
-    btn.textContent = "Оформляем…";
-    try {
-      const order = await api("/api/orders", { method: "POST", body: { ...data, items: state.cart } });
+      const order = await api("/api/orders", { method: "POST", body: { ...data, items: state.cart, delivery: ck.delivery, payment: ck.payment, coupon: ck.coupon } });
       state.cart = [];
+      ck.coupon = "";
       saveCart();
       state.products = [];
       haptic("ok");
       state.tab = "orders";
+      state.stacks.orders = [{ name: "orders" }, { name: "order", params: { id: order.id, fresh: true } }];
+      state.stacks.cart = [{ name: "cart" }];
       renderNav();
-      state.stack = [{ name: "orders" }, { name: "order", params: { id: order.id, fresh: true } }];
       render();
     } catch (err) {
       toast(err.message, true);
-      btn.disabled = false;
-      btn.textContent = `Подтвердить · ${money(total)}`;
+      busy = false;
+      submit.disabled = false;
+      renderTotals();
     }
   };
+  recalc();
 };
 
 // ---------- заказы покупателя ----------
@@ -534,11 +719,11 @@ function orderRow(o, admin) {
     <button class="cell tap has-thumb" data-id="${o.id}">
       <div class="thumb">${photoHtml(o.items[0] && o.items[0].photo)}</div>
       <div class="grow">
-        <div class="title">Заказ #${o.id}</div>
+        <div class="title">Заказ #${o.id}${admin && o.payment_method === "cash" ? ` <span style="color:var(--yellow);font-size:13px">наличные</span>` : ""}</div>
         <div class="sub">${who} · ${fmtDate(o.created_at)}</div>
-        <div style="margin-top:6px">${statusPill(o.status)}</div>
+        <div style="margin-top:6px">${statusPill(o.status)}${admin && o.assignee_name ? ` <span class="sub" style="font-size:12px">· ${esc(o.assignee_name)}</span>` : ""}</div>
       </div>
-      <span class="value">${money(o.total)}</span>${icon("chevronRight", "chev")}
+      <span class="value">${money(o.total)}</span>${chev()}
     </button>`;
 }
 
@@ -551,12 +736,14 @@ screens.orders = async () => {
     return;
   }
   $view.innerHTML = `${title("Заказы")}<div class="group">${orders.map((o) => orderRow(o)).join("")}</div>`;
-  $view.querySelectorAll("[data-id]").forEach((b) => (b.onclick = () => go("order", { id: +b.dataset.id })));
+  $view.querySelectorAll("[data-id]").forEach((b) => (b.onclick = () => go("order", { id: +b.dataset.id, title: `Заказ #${b.dataset.id}` })));
 };
 
-function itemsGroup(o) {
+function totalsGroup(o) {
   return `${header("Состав")}<div class="group">
     ${o.items.map((i) => kv(`${i.title} · ${i.size} × ${i.qty}`, money(i.price * i.qty))).join("")}
+    ${o.discount ? kv(`Скидка${o.coupon_code ? " · " + o.coupon_code : ""}`, `−${money(o.discount)}`, "minus") : ""}
+    ${kv(`Доставка`, o.delivery_price ? money(o.delivery_price) : "бесплатно")}
     <div class="cell total"><span class="title">Итого</span><span class="value" style="flex:1">${money(o.total)}</span></div>
   </div>`;
 }
@@ -567,6 +754,7 @@ function deliveryGroup(o) {
     ${kv("Телефон", esc(o.phone))}
     ${kv("Способ", esc(o.delivery))}
     ${o.address ? kv("Адрес", esc(o.address)) : ""}
+    ${kv("Оплата", o.payment_method === "cash" ? "Наличными при получении" : "Картой")}
     ${o.comment ? kv("Комментарий", esc(o.comment)) : ""}
     ${o.track ? kv("Трек-номер", `<b>${esc(o.track)}</b>`) : ""}
   </div>`;
@@ -590,443 +778,167 @@ screens.order = async ({ id, fresh }) => {
   const orders = await api("/api/orders/my");
   const o = orders.find((x) => x.id === id);
   if (!o) throw new Error("Заказ не найден");
-  const needPay = o.status === "awaiting_payment";
+  const needPay = o.status === "awaiting_payment" && o.payment_method !== "cash";
 
   $view.innerHTML = `
     ${title(fresh ? "Заказ оформлен" : `Заказ #${o.id}`)}
-    <div class="sub" style="color:var(--label-2);margin:-6px 0 14px;font-size:15px">№${o.id} · ${fmtDate(o.created_at)}</div>
+    <div class="subtitle">№${o.id} · ${fmtDate(o.created_at)}</div>
     ${statusCard(o.status)}
-    ${
-      needPay
-        ? `${header("Оплата переводом")}
+    ${needPay ? `${header("Перевод на карту")}
       <div class="group">
-        <div class="cell"><div class="grow"><div class="sub" style="margin:0 0 4px">Реквизиты</div><div class="mono">${esc(state.settings.payment_details)}</div></div><button class="icon-btn" id="copyDetails" aria-label="Скопировать">${icon("copy")}</button></div>
+        <div class="cell"><div class="grow"><div class="sub" style="margin:0 0 4px">${esc(o.card_label || "Карта")}</div><div class="mono">${esc(o.card_details || "")}</div></div><button class="icon-btn" id="copyCard" aria-label="Скопировать">${icon("copy")}</button></div>
         <div class="cell"><div class="grow"><div class="sub" style="margin:0 0 2px">Сумма</div><div class="title"><b>${money(o.total)}</b></div></div><button class="icon-btn" id="copySum" aria-label="Скопировать">${icon("copy")}</button></div>
-        <div class="cell"><div class="grow"><div class="sub" style="margin:0 0 2px">Комментарий к переводу</div><div class="title">Заказ #${o.id}</div></div><button class="icon-btn" id="copyNote" aria-label="Скопировать">${icon("copy")}</button></div>
       </div>
-      ${footer("После перевода загрузи скриншот или PDF чека — или просто отправь его боту в чат.")}`
-        : ""
-    }
-    ${itemsGroup(o)}
+      ${footer(`После перевода загрузи скриншот или PDF чека — или отправь его боту в чат. Без чека заказ снимется через ${state.settings.cancel_hours || 24} ч.`)}` : ""}
+    ${o.status === "done" ? `${header("Оцени заказ")}<div class="group" style="padding:4px 16px 14px">
+      <div class="peek" id="peek">${[1, 2, 3, 4, 5].map(() => `<span class="star">${STAR_SVG}</span>`).join("")}</div>
+      ${o.rating ? `<div class="sub" style="text-align:center">Спасибо за оценку!${o.rating_comment ? ` «${esc(o.rating_comment)}»` : ""}</div>` : `<input class="input" id="rateComment" placeholder="Пара слов — что понравилось?" style="text-align:center;margin-top:6px">`}
+    </div>` : ""}
+    ${totalsGroup(o)}
+    ${o.points_awarded ? footer(`${icon("gift")} За заказ начислено ${num(o.points_awarded)} баллов.`) : ""}
     ${deliveryGroup(o)}
     <div class="stack">
-      ${o.status === "checking" ? `<button class="btn gray" id="reupload">${icon("doc")} Отправить другой чек</button>` : ""}
-      ${supportUrl() ? `<button class="btn gray" id="support">${icon("bubble")} Написать в поддержку</button>` : ""}
-      ${needPay ? `<button class="btn red" id="cancel">Отменить заказ</button>` : ""}
+      ${o.status === "checking" ? `<button class="btn glass" id="reupload">${icon("doc")} Отправить другой чек</button>` : ""}
+      <button class="btn glass" id="support">${icon("bubble")} Написать в поддержку</button>
+      ${["awaiting_payment", "confirmed"].includes(o.status) ? `<button class="btn red" id="cancel">Отменить заказ</button>` : ""}
     </div>`;
 
   const reload = () => screens.order({ id });
   if (needPay) {
-    document.getElementById("copyDetails").onclick = () => copy(state.settings.payment_details);
-    document.getElementById("copySum").onclick = () => copy(String(o.total));
-    document.getElementById("copyNote").onclick = () => copy(`Заказ #${o.id}`);
+    document.getElementById("copyCard").onclick = () => copy((o.card_details || "").split("\n")[0].replace(/\s/g, ""), "Номер карты скопирован");
+    document.getElementById("copySum").onclick = () => copy(String(o.total), "Сумма скопирована");
     setBar(`<button class="btn" id="upload">${icon("doc")} Загрузить чек</button>`).querySelector("#upload").onclick = () => uploadReceipt(o.id, reload);
-    document.getElementById("cancel").onclick = async () => {
-      if (!(await confirmDialog(`Отменить заказ #${o.id}?`))) return;
+  }
+  const peek = document.getElementById("peek");
+  if (peek) FX.peekRating(peek, {
+    value: o.rating || 0,
+    onChange: async (rating) => {
+      haptic("medium");
       try {
-        await api(`/api/orders/${o.id}/cancel`, { method: "POST" });
-        toast("Заказ отменён");
-        state.products = [];
-        reload();
+        const comment = (document.getElementById("rateComment") || {}).value || o.rating_comment || "";
+        await api(`/api/orders/${o.id}/rate`, { method: "POST", body: { rating, comment } });
+        toast("Спасибо за оценку!");
+        setTimeout(reload, 700);
       } catch (err) {
         toast(err.message, true);
       }
-    };
-  }
+    },
+  });
+  const cancel = document.getElementById("cancel");
+  if (cancel) cancel.onclick = async () => {
+    if (!(await confirmDialog(`Отменить заказ #${o.id}?`))) return;
+    try {
+      await api(`/api/orders/${o.id}/cancel`, { method: "POST" });
+      toast("Заказ отменён");
+      state.products = [];
+      reload();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  };
   const re = document.getElementById("reupload");
   if (re) re.onclick = () => uploadReceipt(o.id, reload);
-  const sup = document.getElementById("support");
-  if (sup) sup.onclick = openSupport;
+  document.getElementById("support").onclick = openSupport;
 };
 
-// ---------- управление (админка) ----------
+// ---------- профиль, регистрация, баллы ----------
 
-const ADMIN_TABS = [
-  ["orders", "Заказы"],
-  ["products", "Товары"],
-  ["stock", "Склад"],
-  ["settings", "Настройки"],
-];
-
-function adminHeader() {
-  return `${title("Управление")}
-    <div class="segmented">${ADMIN_TABS.map(([id, l]) => `<button class="${state.adminTab === id ? "active" : ""}" data-atab="${id}">${l}</button>`).join("")}</div>`;
-}
-
-function bindAdminTabs() {
-  $view.querySelectorAll("[data-atab]").forEach((b) => (b.onclick = () => ((state.adminTab = b.dataset.atab), haptic("select"), render())));
-}
-
-screens.admin = async () => {
-  $view.innerHTML = adminHeader() + loaderHtml();
-  bindAdminTabs();
-  await adminTabs[state.adminTab]();
-  bindAdminTabs();
-};
-
-const adminTabs = {};
-
-adminTabs.orders = async () => {
-  const [orders, stats] = await Promise.all([
-    api(`/api/admin/orders${state.adminStatus ? `?status=${state.adminStatus}` : ""}`),
-    api("/api/admin/stats"),
-  ]);
-  const c = (k) => stats.by_status[k] || 0;
-  const filters = [["", "Все"], ["checking", "Проверка"], ["awaiting_payment", "Ждут оплату"], ["paid", "Отправить"], ["shipped", "В пути"], ["done", "Получены"], ["cancelled", "Отменены"]];
-  $view.innerHTML = `${adminHeader()}
-    <div class="tiles">
-      <button class="tile" data-st="checking"><div class="t-ico c-blue">${icon("clock")}</div><b>${c("checking")}</b><span>Проверить оплату</span></button>
-      <button class="tile" data-st="paid"><div class="t-ico c-green">${icon("truck")}</div><b>${c("paid")}</b><span>Нужно отправить</span></button>
-      <button class="tile" data-st="awaiting_payment"><div class="t-ico c-orange">${icon("card")}</div><b>${c("awaiting_payment")}</b><span>Ждут оплату</span></button>
-      <div class="tile"><div class="t-ico c-purple">${icon("chart")}</div><b style="font-size:20px">${money(stats.revenue)}</b><span>Выручка · ${stats.users} ${plural(stats.users, "покупатель", "покупателя", "покупателей")}</span></div>
-    </div>
-    <div class="pills" style="margin-top:14px">${filters
-      .map(([s, l]) => `<button class="pill ${state.adminStatus === s ? "active" : ""}" data-st="${s}">${l}${s && c(s) ? `<span class="count">${c(s)}</span>` : ""}</button>`)
-      .join("")}</div>
-    ${orders.length ? `<div class="group">${orders.map((o) => orderRow(o, true)).join("")}</div>` : emptyHtml("box", "Заказов нет", "")}`;
-  $view.querySelectorAll("[data-st]").forEach((b) => (b.onclick = () => ((state.adminStatus = b.dataset.st), haptic("select"), render())));
-  $view.querySelectorAll("[data-id]").forEach((b) => (b.onclick = () => go("adminOrder", { id: +b.dataset.id })));
-};
-
-screens.adminOrder = async ({ id }) => {
+screens.profile = async () => {
   $view.innerHTML = loaderHtml();
-  const o = await api(`/api/admin/orders/${id}`);
-  const tgLink = o.username ? `https://t.me/${o.username}` : null;
-  const actions = {
-    awaiting_payment: [["paid", "Оплата пришла", "green"], ["cancelled", "Отменить заказ", "red"]],
-    checking: [["paid", "Деньги пришли", "green"], ["awaiting_payment", "Деньги не пришли", "gray"], ["cancelled", "Отменить заказ", "red"]],
-    paid: [["shipped", "Отправлен", ""], ["done", "Получен", "gray"], ["cancelled", "Отменить заказ", "red"]],
-    shipped: [["done", "Получен", ""], ["shipped", "Обновить трек", "gray"], ["cancelled", "Отменить заказ", "red"]],
-  }[o.status] || [];
-
-  $view.innerHTML = `
-    ${title(`Заказ #${o.id}`)}
-    <div style="margin:-6px 0 14px;display:flex;gap:8px;align-items:center">${statusPill(o.status)}<span style="color:var(--label-2);font-size:15px">${fmtDate(o.created_at)}</span></div>
-    ${header("Покупатель")}
-    <div class="group">
-      ${kv("Имя", esc(o.customer_name))}
-      ${kv("Telegram", o.username ? `@${esc(o.username)}` : `id ${o.user_id}`)}
-      ${tgLink ? `<button class="cell tap" id="writeUser"><span class="grow link">Написать в Telegram</span>${icon("chevronRight", "chev")}</button>` : ""}
-    </div>
-    ${itemsGroup(o)}
-    ${deliveryGroup(o)}
-    ${header("Чек")}
-    <div class="group">${
-      o.receipt_file_id
-        ? o.receipt_kind === "photo"
-          ? `<div style="padding-top:14px"><div class="receipt"><img src="${photoUrl(o.receipt_file_id)}" alt="Чек"></div></div>`
-          : `<button class="cell tap" id="openReceipt">${icon("doc")}<span class="grow">Открыть файл чека</span>${icon("chevronRight", "chev")}</button>`
-        : `<div class="cell"><span class="sub" style="margin:0">Покупатель ещё не прислал чек</span></div>`
-    }</div>
-    ${
-      ["paid", "shipped"].includes(o.status)
-        ? `${header("Трек-номер")}<div class="group"><div class="cell"><input class="input" id="track" value="${esc(o.track || "")}" placeholder="Номер отправления"></div></div>`
-        : ""
-    }
-    <div class="stack">${actions.map(([s, l, cls]) => `<button class="btn ${cls}" data-to="${s}">${l}</button>`).join("")}</div>`;
-
-  if (tgLink) document.getElementById("writeUser").onclick = () => openLink(tgLink);
-  const rc = document.getElementById("openReceipt");
-  if (rc) rc.onclick = () => openLink(photoUrl(o.receipt_file_id));
-  $view.querySelectorAll("[data-to]").forEach(
-    (b) =>
-      (b.onclick = async () => {
-        const to = b.dataset.to;
-        const trackEl = document.getElementById("track");
-        const track = trackEl ? trackEl.value.trim() : undefined;
-        if (to === "cancelled" && !(await confirmDialog(`Отменить заказ #${o.id}? Товары вернутся на склад.`))) return;
-        if (to === "awaiting_payment" && !(await confirmDialog("Отклонить чек? Покупателю придёт сообщение, что оплата не найдена."))) return;
-        try {
-          await api(`/api/admin/orders/${o.id}/status`, { method: "POST", body: { status: to, track } });
-          toast(`Статус: ${STATUS[to]}`);
-          screens.adminOrder({ id });
-        } catch (err) {
-          toast(err.message, true);
-        }
-      })
-  );
-};
-
-adminTabs.products = async () => {
-  const products = await api("/api/admin/products");
-  state.adminProducts = products;
-  $view.innerHTML = `${adminHeader()}
-    <button class="btn" id="addProduct" style="margin:10px 0 18px">${icon("plus")} Новый товар</button>
-    ${
-      products.length
-        ? `<div class="group">${products
-            .map(
-              (p) => `
-      <button class="cell tap has-thumb" data-id="${p.id}">
-        <div class="thumb">${photoHtml(p.photos[0])}</div>
-        <div class="grow">
-          <div class="title">${esc(p.title)}</div>
-          <div class="sub">${esc(p.category || "Без категории")} · ${money(p.price)}${p.is_active ? "" : " · скрыт"}</div>
-          <div class="size-chips">${p.sizes.map((s) => `<span class="${s.stock ? "" : "zero"}">${esc(s.size)} ${s.stock}</span>`).join("")}</div>
-        </div>${icon("chevronRight", "chev")}
-      </button>`
-            )
-            .join("")}</div>`
-        : emptyHtml("hanger", "Товаров пока нет", "Добавь первый — он сразу появится в каталоге.")
-    }`;
-  document.getElementById("addProduct").onclick = () => go("productForm", {});
-  $view.querySelectorAll("[data-id]").forEach((b) => (b.onclick = () => go("productForm", { id: +b.dataset.id })));
-};
-
-screens.productForm = async ({ id }) => {
-  const existing = state.adminProducts.find((p) => p.id === id);
-  const p = existing
-    ? JSON.parse(JSON.stringify(existing))
-    : { title: "", category: "", price: "", description: "", sizes: [{ size: "S", stock: 0 }, { size: "M", stock: 0 }, { size: "L", stock: 0 }, { size: "XL", stock: 0 }], photos: [], is_active: true, sort: 0 };
-  const categories = [...new Set(state.adminProducts.map((x) => x.category).filter(Boolean))];
-
-  const draw = () => {
+  const data = await api("/api/profile");
+  state.me = data.user;
+  const s = state.settings;
+  if (!data.user.registered) {
+    const tgUser = (tg && tg.initDataUnsafe && tg.initDataUnsafe.user) || {};
     $view.innerHTML = `
-      ${title(existing ? "Товар" : "Новый товар")}
-      ${header("Фото · первое — обложка")}
-      <div class="group"><div class="photos">
-        ${p.photos.map((ph, i) => `<div><img src="${photoUrl(ph)}" alt=""><button class="rm" data-rmph="${i}" aria-label="Убрать">${icon("xmark")}</button></div>`).join("")}
-        ${p.photos.length < 10 ? `<button class="add" id="addPhoto" aria-label="Добавить фото">${icon("photo")}</button>` : ""}
-      </div></div>
-      ${header("Основное")}
-      <div class="group">
-        <div class="cell field"><label>Название</label><input class="input" id="f_title" value="${esc(p.title)}" placeholder="Худи DAYZ Black"></div>
-        <div class="cell field"><label>Категория</label><input class="input" id="f_category" list="cats" value="${esc(p.category)}" placeholder="Худи, футболки…"><datalist id="cats">${categories.map((c) => `<option value="${esc(c)}">`).join("")}</datalist></div>
-        <div class="cell field"><label>Цена, ${esc(state.settings.currency)}</label><input class="input" id="f_price" type="number" inputmode="numeric" min="0" value="${esc(p.price)}" placeholder="0"></div>
-        <div class="cell field"><label>Описание</label><textarea class="input" id="f_description" placeholder="Материал, посадка, уход">${esc(p.description)}</textarea></div>
+      ${title("Профиль")}
+      <div class="points-card">${FX.lightPillar("dim")}
+        <div class="pc-label">Бонусная программа DAYZ DROP</div>
+        <div class="pc-num">+${num(s.welcome_points)}</div>
+        <div class="pc-sub">баллов сразу после регистрации и ${s.earn_percent}% баллами с каждого заказа. Баллы меняются на скидки и вещи.</div>
       </div>
-      ${header("Размеры и остатки")}
-      <div class="group">
-        ${p.sizes
-          .map(
-            (s, i) => `<div class="cell">
-          <input class="input" data-sz="${i}" value="${esc(s.size)}" placeholder="Размер" style="flex:1">
-          <input class="input num" data-st="${i}" type="number" inputmode="numeric" min="0" value="${s.stock}">
-          <span style="color:var(--label-2);font-size:15px">шт</span>
-          <button class="icon-btn" data-rmsz="${i}" aria-label="Удалить размер">${icon("xmark")}</button></div>`
-          )
-          .join("")}
-        <button class="cell tap" id="addSize"><span class="link">Добавить размер</span></button>
-        <button class="cell tap" id="oneSize"><span class="link">Сделать One size</span></button>
-      </div>
-      ${footer(existing ? "Поступление товара лучше оформлять во вкладке «Склад» → «Оприходовать»: там сохраняется цена закупки и история. Правка здесь запишется как корректировка." : "Начальные остатки запишутся в журнал склада как приход.")}
-      ${header("Публикация")}
-      <div class="group">
-        <label class="cell"><span class="grow title">Показывать в каталоге</span><input type="checkbox" class="switch" id="f_active" ${p.is_active ? "checked" : ""}></label>
-        <div class="cell"><span class="grow title">Порядок</span><input class="input num" id="f_sort" type="number" value="${esc(p.sort)}"></div>
-      </div>
-      ${footer("Чем меньше порядок, тем выше товар в каталоге.")}
-      ${existing ? `<div class="stack"><button class="btn red" id="delete">Удалить товар</button></div>` : ""}`;
-
-    const sync = () => {
-      p.title = document.getElementById("f_title").value;
-      p.category = document.getElementById("f_category").value;
-      p.price = document.getElementById("f_price").value;
-      p.description = document.getElementById("f_description").value;
-      p.sort = document.getElementById("f_sort").value;
-      p.is_active = document.getElementById("f_active").checked;
-      p.sizes = p.sizes.map((s, i) => ({ size: $view.querySelector(`[data-sz="${i}"]`).value.trim(), stock: +$view.querySelector(`[data-st="${i}"]`).value || 0 }));
-    };
-
-    $view.querySelectorAll("[data-rmph]").forEach((b) => (b.onclick = () => (sync(), p.photos.splice(+b.dataset.rmph, 1), draw())));
-    $view.querySelectorAll("[data-rmsz]").forEach((b) => (b.onclick = () => (sync(), p.sizes.splice(+b.dataset.rmsz, 1), draw())));
-    document.getElementById("addSize").onclick = () => (sync(), p.sizes.push({ size: "", stock: 0 }), draw());
-    document.getElementById("oneSize").onclick = () => (sync(), (p.sizes = [{ size: "One size", stock: p.sizes.reduce((s, x) => s + x.stock, 0) }]), draw());
-    const add = document.getElementById("addPhoto");
-    if (add)
-      add.onclick = async () => {
-        sync();
-        const files = await pickFile("image/*", true);
-        for (const f of files.slice(0, 10 - p.photos.length)) {
-          toast("Загружаем фото…");
-          try {
-            const { file_id } = await api("/api/admin/upload", { method: "POST", file: await compressImage(f) });
-            p.photos.push(file_id);
-          } catch (err) {
-            toast(err.message, true);
-          }
-        }
-        draw();
-      };
-    const del = document.getElementById("delete");
-    if (del)
-      del.onclick = async () => {
-        if (!(await confirmDialog(`Удалить «${p.title}»? Старые заказы останутся.`))) return;
-        await api(`/api/admin/products/${id}`, { method: "DELETE" });
-        state.products = [];
-        toast("Товар удалён");
-        back();
-      };
-
-    setBar(`<button class="btn" id="save">Сохранить</button>`).querySelector("#save").onclick = async () => {
-      sync();
+      ${header("Регистрация")}
+      <form id="regForm" onsubmit="return false"><div class="group">
+        <div class="cell field"><label>Имя</label><input class="input" name="name" required value="${esc([tgUser.first_name, tgUser.last_name].filter(Boolean).join(" "))}"></div>
+        <div class="cell field"><label>Телефон</label><input class="input" name="phone" id="regPhone" type="tel" required placeholder="+998 90 123 45 67"></div>
+        ${can("6.9") ? `<button type="button" class="cell tap" id="shareContact">${FX.glassIcon(icon("user"), "blue")}<span class="grow link">Подставить номер из Telegram</span></button>` : ""}
+      </div></form>
+      ${footer("Регистрация необязательна — покупать можно и без неё. Номер нужен только для связи по заказам.")}
+      <div class="stack">
+        <button class="btn glass" id="favs">${icon("star")} Избранное · ${state.favorites.size}</button>
+        <button class="btn glass" id="support">${icon("bubble")} Поддержка</button>
+      </div>`;
+    setBar(`<button class="btn" id="regBtn">Зарегистрироваться</button>`).querySelector("#regBtn").onclick = async () => {
+      const form = document.getElementById("regForm");
+      if (!form.reportValidity()) return;
       try {
-        await api(existing ? `/api/admin/products/${id}` : "/api/admin/products", { method: existing ? "PUT" : "POST", body: p });
-        state.products = [];
-        toast("Сохранено");
-        back();
-      } catch (err) {
-        toast(err.message, true);
-      }
-    };
-  };
-  draw();
-};
-
-// ---------- склад ----------
-
-const KIND_ICON = { receipt: ["arrowDown", "c-green"], sale: ["bag", "c-blue"], return: ["arrowBack", "c-orange"], adjust: ["pencil", "c-gray"] };
-
-function movementRow(m) {
-  const [ico, color] = KIND_ICON[m.kind] || KIND_ICON.adjust;
-  const sign = m.delta > 0 ? `+${m.delta}` : `${m.delta}`;
-  const extra = [m.note, m.cost != null ? `${money(m.cost)}/шт` : ""].filter(Boolean).join(" · ");
-  return `<div class="cell">
-    <div class="lead-ico ${color}">${icon(ico)}</div>
-    <div class="grow"><div class="title" style="font-size:15px">${esc(m.product_title)} · ${esc(m.size)}</div>
-    <div class="sub" style="font-size:13px">${esc(m.kind_label)} · ${fmtDate(m.created_at)}${extra ? ` · ${esc(extra)}` : ""}</div></div>
-    <span class="delta ${m.delta > 0 ? "plus" : "minus"}">${sign}</span>
-  </div>`;
-}
-
-adminTabs.stock = async () => {
-  const data = await api("/api/admin/stock");
-  state.adminProducts = data.products;
-  $view.innerHTML = `${adminHeader()}
-    <div class="tiles">
-      <div class="tile"><div class="t-ico c-green">${icon("box")}</div><b>${data.units}</b><span>${plural(data.units, "единица", "единицы", "единиц")} на складе</span></div>
-      <div class="tile"><div class="t-ico c-orange">${icon("rub")}</div><b style="font-size:20px">${money(data.received_value)}</b><span>Вложено в закупку</span></div>
-    </div>
-    <button class="btn" id="receipt" style="margin:16px 0 0">${icon("tray")} Оприходовать товар</button>
-    ${footer("Пришла партия — нажми, выбери товар и укажи количество по размерам. Остатки обновятся, приход сохранится в журнале.")}
-    ${header("Остатки")}
-    ${
-      data.products.length
-        ? `<div class="group">${data.products
-            .map(
-              (p) => `<button class="cell tap has-thumb" data-id="${p.id}">
-          <div class="thumb">${photoHtml(p.photos[0])}</div>
-          <div class="grow"><div class="title">${esc(p.title)}</div>
-          <div class="size-chips">${p.sizes.map((s) => `<span class="${s.stock ? "" : "zero"}">${esc(s.size)} ${s.stock}</span>`).join("")}</div></div>
-          <span class="value">${stockOf(p)} шт</span>${icon("chevronRight", "chev")}
-        </button>`
-            )
-            .join("")}</div>`
-        : `<div class="group"><div class="cell"><span class="sub" style="margin:0">Сначала добавь товар во вкладке «Товары»</span></div></div>`
-    }
-    ${header("Журнал движений")}
-    ${data.movements.length ? `<div class="group">${data.movements.slice(0, 40).map(movementRow).join("")}</div>` : `<div class="group"><div class="cell"><span class="sub" style="margin:0">Пока пусто</span></div></div>`}`;
-  document.getElementById("receipt").onclick = () => (data.products.length ? go("receiptPick") : toast("Сначала добавь товар", true));
-  $view.querySelectorAll("[data-id]").forEach((b) => (b.onclick = () => go("receipt", { id: +b.dataset.id })));
-};
-
-screens.receiptPick = async () => {
-  $view.innerHTML = `${title("Приход")}${header("Выбери товар")}<div class="group">${state.adminProducts
-    .map(
-      (p) => `<button class="cell tap has-thumb" data-id="${p.id}">
-      <div class="thumb">${photoHtml(p.photos[0])}</div>
-      <div class="grow"><div class="title">${esc(p.title)}</div><div class="sub">Сейчас ${stockOf(p)} шт</div></div>${icon("chevronRight", "chev")}
-    </button>`
-    )
-    .join("")}</div>`;
-  $view.querySelectorAll("[data-id]").forEach((b) => (b.onclick = () => go("receipt", { id: +b.dataset.id })));
-};
-
-screens.receipt = async ({ id }) => {
-  const p = state.adminProducts.find((x) => x.id === id);
-  if (!p) throw new Error("Товар не найден");
-  const rows = p.sizes.map((s) => ({ size: s.size, current: s.stock, qty: "" }));
-
-  const draw = () => {
-    $view.innerHTML = `
-      ${title("Приход")}
-      <div class="group"><div class="cell has-thumb"><div class="thumb">${photoHtml(p.photos[0])}</div><div class="grow"><div class="title">${esc(p.title)}</div><div class="sub">Сейчас на складе ${stockOf(p)} шт</div></div></div></div>
-      ${header("Сколько пришло")}
-      <div class="group">
-        ${rows
-          .map(
-            (r, i) => `<div class="cell">
-          ${r.current == null ? `<input class="input" data-size="${i}" value="${esc(r.size)}" placeholder="Новый размер" style="flex:1">` : `<span class="grow title">${esc(r.size)} <span style="color:var(--label-2);font-size:15px">· есть ${r.current}</span></span>`}
-          <span style="color:var(--green);font-weight:600">+</span>
-          <input class="input num" data-qty="${i}" type="number" inputmode="numeric" min="0" placeholder="0" value="${esc(r.qty)}">
-          <span style="color:var(--label-2);font-size:15px">шт</span>
-        </div>`
-          )
-          .join("")}
-        <button class="cell tap" id="newSize"><span class="link">Новый размер</span></button>
-      </div>
-      ${header("Закупка")}
-      <div class="group">
-        <div class="cell"><span class="grow title">Цена за 1 шт</span><input class="input num" id="cost" type="number" inputmode="numeric" min="0" placeholder="0" style="width:110px"><span style="color:var(--label-2)">${esc(state.settings.currency)}</span></div>
-        <div class="cell"><input class="input" id="note" placeholder="Поставщик или комментарий"></div>
-      </div>
-      ${footer("Цена закупки необязательна — она нужна, чтобы видеть, сколько вложено в товар.")}
-      <div class="group" style="margin-top:20px"><div class="cell total"><span class="title">Итого</span><span class="value" id="sum" style="flex:1"></span></div></div>`;
-
-    const sync = () =>
-      rows.forEach((r, i) => {
-        r.qty = $view.querySelector(`[data-qty="${i}"]`).value;
-        const sizeInput = $view.querySelector(`[data-size="${i}"]`);
-        if (sizeInput) r.size = sizeInput.value.trim();
-      });
-    const updateSum = () => {
-      sync();
-      const units = rows.reduce((s, r) => s + (+r.qty || 0), 0);
-      const cost = +document.getElementById("cost").value || 0;
-      document.getElementById("sum").textContent = `${units} шт${cost ? ` · ${money(units * cost)}` : ""}`;
-    };
-    $view.querySelectorAll("[data-qty], #cost").forEach((el) => (el.oninput = updateSum));
-    document.getElementById("newSize").onclick = () => (sync(), rows.push({ size: "", current: null, qty: "" }), draw());
-    updateSum();
-
-    setBar(`<button class="btn" id="save">${icon("tray")} Оприходовать</button>`).querySelector("#save").onclick = async () => {
-      sync();
-      const items = rows.filter((r) => r.size && +r.qty > 0).map((r) => ({ size: r.size, qty: +r.qty }));
-      if (!items.length) return toast("Укажи количество хотя бы по одному размеру", true);
-      try {
-        await api("/api/admin/stock/receipt", {
-          method: "POST",
-          body: { product_id: p.id, items, cost: document.getElementById("cost").value, note: document.getElementById("note").value || "Приход товара" },
-        });
-        state.products = [];
-        toast(`Оприходовано ${items.reduce((s, i) => s + i.qty, 0)} шт`);
-        state.adminTab = "stock";
-        state.stack = [{ name: "admin" }];
+        const user = await api("/api/profile/register", { method: "POST", body: Object.fromEntries(new FormData(form)) });
+        state.me = user;
+        toast(`Готово! +${num(user.points)} баллов`);
         render();
       } catch (err) {
         toast(err.message, true);
       }
     };
-  };
-  draw();
-};
+    const share = document.getElementById("shareContact");
+    if (share) share.onclick = () => tg.requestContact((ok, res) => {
+      const phone = res && res.responseUnsafe && res.responseUnsafe.contact && res.responseUnsafe.contact.phone_number;
+      if (phone) document.getElementById("regPhone").value = phone;
+      else if (ok) toast("Номер отправлен боту — введи его здесь тоже");
+    });
+    document.getElementById("favs").onclick = () => go("favorites", { title: "Избранное" });
+    document.getElementById("support").onclick = openSupport;
+    return;
+  }
 
-// ---------- настройки ----------
-
-adminTabs.settings = async () => {
-  const s = await api("/api/admin/settings");
-  $view.innerHTML = `${adminHeader()}
-    ${header("Оплата")}
-    <div class="group"><div class="cell field"><label>Реквизиты для перевода</label><textarea class="input" id="s_payment_details" rows="4" placeholder="Карта 0000 0000 0000 0000&#10;Банк, получатель">${esc(s.payment_details)}</textarea></div></div>
-    ${footer("Покупатель увидит их после оформления заказа — в мини-аппе и в сообщении от бота.")}
-    ${header("Магазин")}
-    <div class="group">
-      <div class="cell"><span class="grow title">Валюта</span><input class="input num" id="s_currency" value="${esc(s.currency)}"></div>
-      <div class="cell field"><label>Способы доставки — каждый с новой строки</label><textarea class="input" id="s_delivery_options">${esc(s.delivery_options)}</textarea></div>
-      <div class="cell field"><label>О магазине</label><textarea class="input" id="s_about">${esc(s.about)}</textarea></div>
-    </div>`;
-  setBar(`<button class="btn" id="save">Сохранить</button>`).querySelector("#save").onclick = async () => {
-    const body = {};
-    ["payment_details", "currency", "delivery_options", "about"].forEach((k) => (body[k] = document.getElementById(`s_${k}`).value));
+  const u = data.user;
+  const activeCoupons = data.coupons.filter((c) => !c.spent);
+  $view.innerHTML = `
+    ${title(u.full_name || u.first_name || "Профиль")}
+    <div class="subtitle">${esc(u.phone || "")}</div>
+    <div class="points-card">${FX.lightPillar("dim")}
+      <div class="pc-label">Твои баллы</div>
+      <div class="pc-num" id="pts">0</div>
+      <div class="pc-sub">${s.earn_percent}% от каждого полученного заказа возвращаются баллами</div>
+    </div>
+    <div class="bento" style="margin-top:12px">
+      <button class="bento-card" id="bOrders"><div class="b-top">${FX.glassIcon(icon("box"), "indigo")}</div><div><div class="b-num">${data.orders_count}</div><div class="b-label">${plural(data.orders_count, "заказ", "заказа", "заказов")}</div></div></button>
+      <button class="bento-card" id="bFavs"><div class="b-top">${FX.glassIcon(icon("star"), "pink")}</div><div><div class="b-num">${state.favorites.size}</div><div class="b-label">в избранном</div></div></button>
+    </div>
+    ${header("Обменять баллы")}
+    ${data.rewards.length ? `<div class="group">${data.rewards.map((r) => `
+      <div class="cell has-ico reward">
+        ${FX.glassIcon(icon(r.kind === "gift" ? "gift" : "ticket"), r.kind === "gift" ? "orange" : "purple")}
+        <div class="grow"><div class="title">${esc(r.title)}</div><div class="sub">${esc(r.label)}</div></div>
+        <button class="btn sm ${u.points >= r.cost ? "" : "glass"}" data-reward="${r.id}" ${u.points >= r.cost ? "" : "disabled"}>${num(r.cost)} б.</button>
+      </div>`).join("")}</div>` : `<div class="group"><div class="cell"><span class="sub" style="margin:0">Скоро здесь появятся награды за баллы</span></div></div>`}
+    ${header("Мои купоны")}
+    ${data.coupons.length ? `<div class="group">${data.coupons.map((c) => `
+      <div class="coupon ${c.spent ? "spent" : ""}">${FX.glassIcon(icon("ticket"), "teal")}
+        <div class="grow"><div class="code">${esc(c.code)}</div><div class="sub">${esc(c.title || c.label)}${c.spent ? " · использован" : ""}</div></div>
+        ${c.spent ? "" : `<button class="icon-btn" data-copy="${esc(c.code)}" aria-label="Скопировать">${icon("copy")}</button>`}
+      </div>`).join("")}</div>${activeCoupons.length ? footer("Введи код при оформлении заказа — или выбери купон прямо там.") : ""}` : `<div class="group"><div class="cell"><span class="sub" style="margin:0">Обменяй баллы — купон появится здесь</span></div></div>`}
+    ${header("История баллов")}
+    <div class="group">${data.history.slice(0, 8).map((t) => `
+      <div class="cell"><div class="grow"><div class="title" style="font-size:15px">${esc(t.reason)}</div><div class="sub" style="font-size:12px">${fmtDate(t.created_at)}</div></div>
+      <span class="delta ${t.delta > 0 ? "plus" : "minus"}">${t.delta > 0 ? "+" : ""}${num(t.delta)}</span></div>`).join("") || `<div class="cell"><span class="sub" style="margin:0">Пока пусто</span></div>`}</div>
+    <div class="stack"><button class="btn glass" id="support">${icon("bubble")} Поддержка</button></div>`;
+  FX.countUp(document.getElementById("pts"), u.points);
+  document.getElementById("bOrders").onclick = () => switchTab("orders");
+  document.getElementById("bFavs").onclick = () => go("favorites", { title: "Избранное" });
+  document.getElementById("support").onclick = openSupport;
+  $view.querySelectorAll("[data-copy]").forEach((b) => (b.onclick = () => copy(b.dataset.copy, "Код скопирован")));
+  $view.querySelectorAll("[data-reward]").forEach((b) => (b.onclick = async () => {
+    const reward = data.rewards.find((r) => r.id === +b.dataset.reward);
+    if (!(await confirmDialog(`Обменять ${num(reward.cost)} баллов на «${reward.title}»?`))) return;
     try {
-      await api("/api/admin/settings", { method: "PUT", body });
-      const boot = await api("/api/bootstrap");
-      state.settings = boot.settings;
-      toast("Настройки сохранены");
+      const res = await api(`/api/rewards/${reward.id}/exchange`, { method: "POST" });
+      toast(`Купон ${res.coupon.code} — уже в профиле`);
+      render();
     } catch (err) {
       toast(err.message, true);
     }
-  };
+  }));
 };
 
 // ---------- старт ----------
@@ -1039,42 +951,47 @@ async function boot() {
       tg.setHeaderColor("#000000");
       tg.setBackgroundColor("#000000");
       if (tg.setBottomBarColor) tg.setBottomBarColor("#000000");
+      if (tg.disableVerticalSwipes) tg.disableVerticalSwipes();
     } catch (_) {}
     if (can("6.1")) tg.BackButton.onClick(back);
   }
+  FX.clickSpark();
+  FX.pointerLights();
   $view.innerHTML = loaderHtml("Загружаем DAYZ DROP");
 
   if (!tg || !tg.initData) {
-    $view.innerHTML = `<div class="hero"><img src="assets/logo-banner.jpg" alt="DAYZ DROP"></div>${emptyHtml("bag", "Открой магазин в Telegram", "Мини-приложение работает внутри бота DAYZ DROP.")}`;
+    $view.innerHTML = `<section class="hero">${FX.lightPillar()}<img class="logo" src="assets/logo-banner.jpg" alt="DAYZ DROP"></section>${emptyHtml("bag", "Открой магазин в Telegram", "Мини-приложение работает внутри бота DAYZ DROP.")}`;
     return;
   }
-
   try {
     const data = await api("/api/bootstrap");
     state.me = data.user;
     state.isAdmin = data.is_admin;
     state.botUsername = data.bot_username;
     state.settings = data.settings;
+    state.favorites = new Set(data.favorites);
+    state.subs = new Set(data.subscriptions.map((s) => `${s.product_id}:${s.size}`));
   } catch (err) {
     $view.innerHTML = emptyHtml("warning", "Не удалось загрузить магазин", err.message, "Повторить");
     document.getElementById("emptyBtn").onclick = () => location.reload();
     return;
   }
 
-  // Ссылки из бота: ?page=order&id=12 или ?page=admin&order=12
+  // Ссылки из бота: ?page=order&id=12, ?page=product&id=3, ?page=profile, ?page=admin&order=12, ?page=admin&section=settings
   const page = qs.get("page");
+  const idParam = +qs.get("id");
   if (page === "admin" && state.isAdmin) {
     state.tab = "admin";
-    state.stack = [{ name: "admin" }];
-    if (qs.get("order")) state.stack.push({ name: "adminOrder", params: { id: +qs.get("order") } });
-  } else if (page === "order" && qs.get("id")) {
+    if (qs.get("order")) state.stacks.admin.push({ name: "adminOrders", params: { title: "Заказы" } }, { name: "adminOrder", params: { id: +qs.get("order"), title: `Заказ #${qs.get("order")}` } });
+    if (qs.get("section") === "settings") state.stacks.admin.push({ name: "adminSettings", params: { title: "Настройки" } });
+  } else if (page === "order" && idParam) {
     state.tab = "orders";
-    state.stack = [{ name: "orders" }, { name: "order", params: { id: +qs.get("id") } }];
-  } else {
-    state.stack = [{ name: "catalog" }];
+    state.stacks.orders.push({ name: "order", params: { id: idParam, title: `Заказ #${idParam}` } });
+  } else if (page === "product" && idParam) {
+    state.stacks.catalog.push({ name: "product", params: { id: idParam } });
+  } else if (page === "profile") {
+    state.tab = "profile";
   }
   renderNav();
   render();
 }
-
-boot();

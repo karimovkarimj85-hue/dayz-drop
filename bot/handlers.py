@@ -33,6 +33,9 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
     if command.args == "support":
         await shop_bot.start_support(message, state)
         return
+    if command.args == "profile":
+        await shop_bot.send_profile(message, message.from_user.id)
+        return
     is_admin = message.from_user.id in ADMIN_IDS
     caption = texts.WELCOME + (texts.WELCOME_ADMIN if is_admin else "")
     _, markup = await shop_bot.menu_view(message.from_user.id)
@@ -67,6 +70,14 @@ async def cmd_cart(message: Message, state: FSMContext) -> None:
     await state.clear()
     text, markup = await shop_bot.cart_view(message.from_user.id)
     await message.answer(text, reply_markup=markup)
+
+
+@router.message(Command("profile"))
+async def cmd_profile(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    async with Session() as session:
+        await services.upsert_user(session, message.from_user)
+    await shop_bot.send_profile(message, message.from_user.id)
 
 
 @router.message(Command("support"))
@@ -177,7 +188,8 @@ async def cb_payment_decision(call: CallbackQuery) -> None:
             await call.answer(f"Уже решено: {texts.STATUS_LABELS[order.status]}", show_alert=True)
             await call.message.edit_reply_markup(reply_markup=keyboards.admin_order_kb(order.id))
             return
-        await services.change_status(session, order, "paid" if confirmed else "awaiting_payment")
+        await services.change_status(session, order, "paid" if confirmed else "awaiting_payment",
+                                     actor=call.from_user.full_name)
 
     admin_name = call.from_user.full_name
     await call.message.edit_caption(

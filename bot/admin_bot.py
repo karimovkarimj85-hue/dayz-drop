@@ -6,10 +6,12 @@ from aiogram import F, Router
 from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, Message
 from sqlalchemy import func, select
 
+import finance
 import keyboards
+import tasks
 import services
 import texts
 from config import ADMIN_IDS, WEBAPP_URL
@@ -26,7 +28,8 @@ NOT_COMMAND = ~F.text.startswith("/")
 PAGE = 8
 LIST_TITLES = {
     "checking": "🔎 Ждут проверки оплаты",
-    "awaiting_payment": "⏳ Ждут оплату",
+    "awaiting_payment": "⏳ Ждут оплату картой",
+    "confirmed": "🤝 Наличные — ждут выдачи",
     "paid": "📦 Оплачены — нужно отправить",
     "shipped": "🚚 В пути",
     "all": "🗂 Все заказы",
@@ -34,6 +37,7 @@ LIST_TITLES = {
 ORDER_ACTIONS = {
     "awaiting_payment": [("✅ Оплата пришла", "paid")],
     "checking": [("✅ Деньги пришли", "paid"), ("❌ Не пришли", "awaiting_payment")],
+    "confirmed": [("🚚 Передан курьеру (ввести трек)", "ship"), ("📦 Выдан и оплачен", "done"), ("💵 Деньги получены заранее", "paid")],
     "paid": [("🚚 Отправлен (ввести трек)", "ship"), ("📦 Получен", "done")],
     "shipped": [("📦 Получен", "done"), ("✏️ Изменить трек", "ship")],
 }
@@ -125,12 +129,15 @@ async def admin_menu_view():
         counts = dict((await session.execute(select(Order.status, func.count()).group_by(Order.status))).all())
     rows = [
         [btn(f"🔎 На проверке ({counts.get('checking', 0)})", "ol:checking:0")],
-        [btn(f"⏳ Ждут оплату ({counts.get('awaiting_payment', 0)})", "ol:awaiting_payment:0")],
+        [btn(f"⏳ Ждут оплату ({counts.get('awaiting_payment', 0)})", "ol:awaiting_payment:0"),
+         btn(f"🤝 Наличные ({counts.get('confirmed', 0)})", "ol:confirmed:0")],
         [btn(f"📦 Отправить ({counts.get('paid', 0)})", "ol:paid:0"), btn(f"🚚 В пути ({counts.get('shipped', 0)})", "ol:shipped:0")],
         [btn("🗂 Все заказы", "ol:all:0")],
         [btn("➕ Добавить товар", "np"), btn("👕 Товары", "apl:0")],
         [btn("📥 Приход товара", "srp:0"), btn("📜 Движения склада", "smv")],
-        [btn("⚙️ Настройки", "aset"), btn("📊 Статистика", "astat")],
+        [btn("💰 Касса сегодня", "fin"), btn("📤 Excel", "exp")],
+        [btn("📣 Рассылка", "bc"), btn("📊 Статистика", "astat")],
+        [btn("⚙️ Настройки", "aset")],
     ]
     if WEBAPP_URL:
         rows.append([keyboards._app_button("🛍 Админка в мини-аппе", page="admin")])
@@ -179,6 +186,10 @@ async def order_card_view(order_id: int):
     if not order:
         return "Заказ не найден", kb([btn("⬅️ Админка", "adm")])
     rows = [[btn(label, f"os:{order.id}:{action}")] for label, action in ORDER_ACTIONS.get(order.status, [])]
+    if order.status not in ("done", "cancelled"):
+        rows.insert(0, [btn("👷 Снять с себя" if order.assignee_id else "👷 Взять в работу", f"os:{order.id}:take")])
+    if order.payment_method == "cash" and order.status in ("confirmed", "shipped"):
+        rows.append([btn("🙅 Не выкупил (отменить и запретить наличные)", f"os:{order.id}:noshow?")])
     if order.receipt_file_id:
         rows.append([btn("🧾 Показать чек", f"orc:{order.id}")])
     if order.username:
@@ -222,21 +233,44 @@ async def cb_order_status(call: CallbackQuery, state: FSMContext) -> None:
                    kb([btn("Да, отменить", f"os:{order_id}:cancelled"), btn("Нет", f"ao:{order_id}")]))
         await call.answer()
         return
+    if action == "noshow?":
+        await show(call, f"Покупатель не выкупил заказ #{order_id}? Заказ отменится, вещи вернутся на склад, "
+                         "а этому покупателю будет доступна только предоплата картой.",
+                   kb([btn("Да, не выкупил", f"os:{order_id}:noshow"), btn("Нет", f"ao:{order_id}")]))
+        await call.answer()
+        return
     if action == "ship":
         await state.set_state(ShipTrack.track)
         await state.update_data(order_id=order_id)
         await call.message.answer(texts.ASK_TRACK, reply_markup=kb([btn("Без трека", "ship_none")], [btn("❌ Отмена", f"ao:{order_id}")]))
         await call.answer()
         return
+    who = call.from_user.full_name
     async with Session() as session:
         order = await session.get(Order, order_id)
         try:
-            await services.change_status(session, order, action)
+            if action == "take":
+                await services.toggle_assign(session, order, call.from_user.id, who)
+            elif action == "noshow":
+                await services.change_status(session, order, "cancelled", actor=f"{who} (не выкупил)")
+                customer = await session.get(User, order.user_id)
+                if customer:
+                    customer.no_cash = True
+                    await session.commit()
+            else:
+                await services.change_status(session, order, action, actor=who)
         except services.ShopError as exc:
             await call.answer(str(exc), show_alert=True)
             return
     await show(call, *(await order_card_view(order_id)))
-    await call.answer(f"Статус: {texts.STATUS_LABELS[action]}")
+    if action == "take":
+        await call.answer("Заказ за тобой" if order.assignee_id else "Снял с себя")
+        others = ADMIN_IDS - {call.from_user.id}
+        if order.assignee_id:
+            for admin_id in others:
+                await services.safe_send(admin_id, f"👷 {texts.e(who)} взял в работу заказ #{order.id}")
+    else:
+        await call.answer(f"Статус: {texts.STATUS_PLAIN['cancelled' if action == 'noshow' else action]}")
 
 
 async def _ship(message: Message, state: FSMContext, track: str) -> None:
@@ -245,7 +279,7 @@ async def _ship(message: Message, state: FSMContext, track: str) -> None:
     async with Session() as session:
         order = await session.get(Order, order_id)
         try:
-            await services.change_status(session, order, "shipped", track)
+            await services.change_status(session, order, "shipped", track, actor=message.from_user.full_name)
         except services.ShopError as exc:
             await message.answer(f"⚠️ {texts.e(exc)}")
             return
@@ -394,7 +428,7 @@ async def on_product_value(message: Message, state: FSMContext) -> None:
     async with Session() as session:
         product = await session.get(Product, data["product_id"])
         if field == "sizes":
-            services.apply_sizes(session, product, value, message.from_user.id)
+            await services.apply_sizes(session, product, value, message.from_user.id)
         else:
             setattr(product, field, value)
         await session.commit()
@@ -636,11 +670,11 @@ async def cb_settings(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     async with Session() as session:
         settings = await services.get_settings(session)
-    markup = kb(
-        [btn("💳 Реквизиты", "asv:payment_details")],
-        [btn("💱 Валюта", "asv:currency"), btn("🚚 Доставка", "asv:delivery_options")],
-        [btn("⬅️ Админка", "adm")],
-    )
+    rows = [[btn("💱 Валюта", "asv:currency")]]
+    if WEBAPP_URL:
+        rows.append([keyboards._app_button("⚙️ Карты, доставка, баллы — в мини-аппе", page="admin", section="settings")])
+    rows.append([btn("⬅️ Админка", "adm")])
+    markup = kb(*rows)
     await show(call, texts.admin_settings(settings), markup)
     await call.answer()
 
@@ -673,13 +707,92 @@ async def on_setting_value(message: Message, state: FSMContext) -> None:
 async def cb_stats(call: CallbackQuery) -> None:
     async with Session() as session:
         by_status = dict((await session.execute(select(Order.status, func.count()).group_by(Order.status))).all())
-        revenue = (
-            await session.execute(
-                select(func.coalesce(func.sum(Order.total), 0)).where(Order.status.in_(["paid", "shipped", "done"]))
-            )
-        ).scalar_one()
+        revenue = (await finance.report(session, "all"))["revenue"]
         users = (await session.execute(select(func.count()).select_from(User))).scalar_one()
         products = (await session.execute(select(func.count()).select_from(Product))).scalar_one()
         currency = (await services.get_settings(session))["currency"]
     await show(call, texts.admin_stats(by_status, int(revenue), users, products, currency), kb([btn("⬅️ Админка", "adm")]))
+    await call.answer()
+
+
+# ---------- касса, выгрузки, рассылка ----------
+
+@router.callback_query(F.data == "fin")
+async def cb_finance(call: CallbackQuery) -> None:
+    async with Session() as session:
+        text = await finance.daily_report_text(session)
+    await show(call, text, kb([btn("📤 Выгрузить в Excel", "exp")], [btn("⬅️ Админка", "adm")]))
+    await call.answer()
+
+
+@router.callback_query(F.data == "exp")
+async def cb_export_menu(call: CallbackQuery) -> None:
+    await show(call, "📤 <b>Выгрузка в Excel</b>\nЧто выгрузить? Файл придёт сюда.", kb(
+        [btn("🧾 Заказы", "exp:orders"), btn("📦 Склад", "exp:stock")],
+        [btn("💰 Касса", "exp:finance"), btn("👥 Покупатели", "exp:customers")],
+        [btn("🗂 Всё одним файлом", "exp:all")],
+        [btn("💾 Резервная копия базы", "exp:backup")],
+        [btn("⬅️ Админка", "adm")],
+    ))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("exp:"))
+async def cb_export(call: CallbackQuery) -> None:
+    kind = call.data.split(":")[1]
+    await call.answer("Готовлю файл…")
+    async with Session() as session:
+        content, filename = await (finance.backup_zip(session) if kind == "backup" else finance.export_xlsx(session, kind))
+    await call.message.answer_document(BufferedInputFile(content, filename=filename), caption=f"📤 {filename}")
+
+
+class BroadcastForm(StatesGroup):
+    message = State()
+
+
+_broadcast_drafts: dict[int, dict] = {}
+
+
+@router.callback_query(F.data == "bc")
+async def cb_broadcast(call: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(BroadcastForm.message)
+    await call.message.answer(texts.BROADCAST_ASK, reply_markup=kb([btn("❌ Отмена", "adm")]))
+    await call.answer()
+
+
+@router.message(BroadcastForm.message, F.photo | (F.text & NOT_COMMAND))
+async def on_broadcast_message(message: Message, state: FSMContext) -> None:
+    draft = {
+        "text": message.html_text if (message.text or message.caption) else "",
+        "photo": message.photo[-1].file_id if message.photo else None,
+    }
+    if not draft["text"] and not draft["photo"]:
+        await message.answer("Пришли текст или фото с подписью.")
+        return
+    _broadcast_drafts[message.from_user.id] = draft
+    await state.clear()
+    preview_markup = keyboards.shop_open_kb()
+    if draft["photo"]:
+        await message.answer_photo(draft["photo"], caption=draft["text"] or None, reply_markup=preview_markup)
+    else:
+        await message.answer(draft["text"], reply_markup=preview_markup)
+    async with Session() as session:
+        total = (await session.execute(select(func.count()).select_from(User))).scalar_one()
+        registered = (await session.execute(
+            select(func.count()).select_from(User).where(User.registered_at.is_not(None)))).scalar_one()
+    await message.answer("☝️ Так увидят покупатели. Кому отправить?", reply_markup=kb(
+        [btn(f"📣 Всем ({total})", "bcs:all")],
+        [btn(f"🎁 Только зарегистрированным ({registered})", "bcs:registered")],
+        [btn("❌ Отмена", "adm")],
+    ))
+
+
+@router.callback_query(F.data.startswith("bcs:"))
+async def cb_broadcast_send(call: CallbackQuery) -> None:
+    draft = _broadcast_drafts.pop(call.from_user.id, None)
+    if not draft:
+        await call.answer("Черновик потерялся — начни заново", show_alert=True)
+        return
+    asyncio.create_task(tasks.broadcast(call.from_user.id, draft["text"], draft["photo"], call.data.split(":")[1], True))
+    await call.message.edit_text("📣 Рассылка запущена — напишу, когда закончу.")
     await call.answer()

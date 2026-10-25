@@ -1,4 +1,4 @@
-"""HTTP API для мини-аппа. Каждый запрос подписан Telegram (initData) — подделать пользователя нельзя."""
+"""HTTP API мини-аппа для покупателя. Каждый запрос подписан Telegram (initData) — подделать пользователя нельзя."""
 import json
 import logging
 import mimetypes
@@ -6,13 +6,14 @@ from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 
 from aiohttp import web
-from aiogram.types import BufferedInputFile
 from aiogram.utils.web_app import safe_parse_webapp_init_data
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
+import finance
+import loyalty
 import services
 from config import ADMIN_IDS, BOT_TOKEN
-from db import Order, Product, Session, StockMovement, User
+from db import Coupon, Favorite, Order, Product, Reward, Session, Subscription, User, aware
 from loader import bot
 
 log = logging.getLogger(__name__)
@@ -93,17 +94,29 @@ async def read_upload(request: web.Request):
     return content, file.filename or "file", (file.content_type or "").lower()
 
 
-def product_json(p: Product) -> dict:
+def iso(dt) -> str | None:
+    return aware(dt).isoformat() if dt else None
+
+
+def product_json(p: Product, ratings: dict | None = None, likes: dict | None = None) -> dict:
+    rating = (ratings or {}).get(p.id)
     return {
         "id": p.id,
         "title": p.title,
         "description": p.description,
         "category": p.category,
         "price": p.price,
+        "old_price": p.old_price,
         "sizes": p.sizes,
         "photos": p.photos,
+        "size_chart": p.size_chart,
+        "badge": p.badge,
         "is_active": p.is_active,
         "sort": p.sort,
+        "rating": round(rating[0] / rating[1], 1) if rating else None,
+        "rating_count": rating[1] if rating else 0,
+        "likes": (likes or {}).get(p.id, 0),
+        "created_at": iso(p.created_at),
     }
 
 
@@ -111,6 +124,10 @@ def order_json(o: Order, admin: bool = False) -> dict:
     data = {
         "id": o.id,
         "items": o.items,
+        "subtotal": o.subtotal if o.subtotal is not None else o.total,
+        "discount": o.discount or 0,
+        "coupon_code": o.coupon_code,
+        "delivery_price": o.delivery_price or 0,
         "total": o.total,
         "status": o.status,
         "track": o.track,
@@ -119,27 +136,73 @@ def order_json(o: Order, admin: bool = False) -> dict:
         "delivery": o.delivery,
         "address": o.address,
         "comment": o.comment,
+        "payment_method": o.payment_method or "card",
+        "card_label": o.card_label,
+        "card_details": o.card_details if o.status in ("awaiting_payment", "checking") else None,
         "has_receipt": bool(o.receipt_file_id),
-        "created_at": o.created_at.isoformat() if o.created_at else None,
+        "points_awarded": o.points_awarded or 0,
+        "rating": o.rating,
+        "rating_comment": o.rating_comment,
+        "created_at": iso(o.created_at),
+        "paid_at": iso(o.paid_at),
     }
     if admin:
+        cogs, unknown = finance.order_cogs(o)
         data.update(
             user_id=o.user_id,
             username=o.username,
             receipt_file_id=o.receipt_file_id,
             receipt_kind=o.receipt_kind,
+            paid_via=o.paid_via,
+            assignee_id=o.assignee_id,
+            assignee_name=o.assignee_name,
+            history=o.history or [],
+            cogs=cogs,
+            cogs_unknown=unknown,
+            card_details=o.card_details,
         )
     return data
+
+
+def user_json(u: User | None) -> dict:
+    if not u:
+        return {"registered": False, "points": 0}
+    return {
+        "id": u.id,
+        "username": u.username,
+        "first_name": u.first_name,
+        "full_name": u.full_name,
+        "phone": u.phone,
+        "registered": bool(u.registered_at),
+        "registered_at": iso(u.registered_at),
+        "points": u.points or 0,
+    }
 
 
 def public_settings(settings: dict) -> dict:
     return {
         "currency": settings["currency"],
-        "delivery_options": services.delivery_options(settings),
-        "support_contact": settings["support_contact"],
-        "payment_details": settings["payment_details"],
         "about": settings["about"],
+        "delivery_methods": services.delivery_methods(settings),
+        "card_payments": bool(services.active_cards(settings)),
+        "loyalty_enabled": settings["loyalty_enabled"],
+        "earn_percent": settings["earn_percent"],
+        "welcome_points": settings["welcome_points"],
+        "cancel_hours": settings["cancel_hours"],
     }
+
+
+async def product_stats(session) -> tuple[dict, dict]:
+    """Средние оценки (из полученных заказов) и число «сердечек» по товарам."""
+    ratings: dict[int, list[int]] = {}
+    rated = (await session.execute(select(Order).where(Order.rating.is_not(None)))).scalars()
+    for o in rated:
+        for pid in {i["product_id"] for i in o.items}:
+            acc = ratings.setdefault(pid, [0, 0])
+            acc[0] += o.rating
+            acc[1] += 1
+    likes = dict((await session.execute(select(Favorite.product_id, func.count()).group_by(Favorite.product_id))).all())
+    return ratings, likes
 
 
 @routes.get("/health")
@@ -172,33 +235,79 @@ async def photo(request: web.Request):
     return web.Response(body=body, content_type=content_type, headers={"Cache-Control": "public, max-age=2592000"})
 
 
-# ---------- покупатель ----------
+# ---------- старт и каталог ----------
 
 @routes.get("/api/bootstrap")
 async def bootstrap(request: web.Request):
-    user = current_user(request)
+    tg_user = current_user(request)
     async with Session() as session:
-        await services.upsert_user(session, user)
+        user = await services.upsert_user(session, tg_user)
         settings = await services.get_settings(session)
-    return web.json_response(
-        {
-            "user": {"id": user.id, "first_name": user.first_name},
-            "is_admin": user.id in ADMIN_IDS,
-            "bot_username": (await bot.me()).username,
-            "settings": public_settings(settings),
-        }
-    )
+        favorites = [r[0] for r in (await session.execute(
+            select(Favorite.product_id).where(Favorite.user_id == tg_user.id))).all()]
+        subs = [{"product_id": s.product_id, "size": s.size} for s in (await session.execute(
+            select(Subscription).where(Subscription.user_id == tg_user.id))).scalars()]
+    return web.json_response({
+        "user": user_json(user),
+        "is_admin": tg_user.id in ADMIN_IDS,
+        "bot_username": (await bot.me()).username,
+        "settings": public_settings(settings),
+        "favorites": favorites,
+        "subscriptions": subs,
+    })
 
 
 @routes.get("/api/products")
 async def products(request: web.Request):
     async with Session() as session:
-        rows = (
-            await session.execute(
-                select(Product).where(Product.is_active.is_(True)).order_by(Product.sort, Product.id.desc())
-            )
-        ).scalars().all()
-    return web.json_response([product_json(p) for p in rows])
+        rows = await services.active_products(session)
+        ratings, likes = await product_stats(session)
+    return web.json_response([product_json(p, ratings, likes) for p in rows])
+
+
+@routes.post("/api/favorites/{product_id}")
+async def toggle_favorite(request: web.Request):
+    user = current_user(request)
+    product_id = int(request.match_info["product_id"])
+    async with Session() as session:
+        await services.upsert_user(session, user)
+        fav = await session.get(Favorite, (user.id, product_id))
+        if fav:
+            await session.delete(fav)
+        else:
+            session.add(Favorite(user_id=user.id, product_id=product_id))
+        await session.commit()
+        count = (await session.execute(
+            select(func.count()).select_from(Favorite).where(Favorite.product_id == product_id))).scalar_one()
+    return web.json_response({"favorite": not fav, "likes": count})
+
+
+@routes.post("/api/subscribe")
+async def subscribe(request: web.Request):
+    """«Сообщить о поступлении»: on=true — подписаться, false — отписаться."""
+    user = current_user(request)
+    data = await read_json(request)
+    product_id, size = int(data.get("product_id") or 0), str(data.get("size") or "*")[:20]
+    async with Session() as session:
+        await services.upsert_user(session, user)
+        await session.execute(delete(Subscription).where(
+            Subscription.user_id == user.id, Subscription.product_id == product_id, Subscription.size == size))
+        if data.get("on", True):
+            session.add(Subscription(user_id=user.id, product_id=product_id, size=size))
+        await session.commit()
+    return web.json_response({"subscribed": bool(data.get("on", True))})
+
+
+# ---------- заказ ----------
+
+@routes.post("/api/quote")
+async def quote(request: web.Request):
+    """Предпросмотр итога: доставка, купон, способы оплаты — пересчитывается при каждом изменении."""
+    user = current_user(request)
+    data = await read_json(request)
+    async with Session() as session:
+        q = await services.quote(session, user.id, data)
+    return web.json_response(services.quote_json(q))
 
 
 @routes.post("/api/orders")
@@ -206,6 +315,7 @@ async def create_order(request: web.Request):
     user = current_user(request)
     data = await read_json(request)
     async with Session() as session:
+        await services.upsert_user(session, user)
         order = await services.create_order(session, user, data)
     return web.json_response(order_json(order))
 
@@ -214,11 +324,9 @@ async def create_order(request: web.Request):
 async def my_orders(request: web.Request):
     user = current_user(request)
     async with Session() as session:
-        rows = (
-            await session.execute(
-                select(Order).where(Order.user_id == user.id).order_by(Order.id.desc()).limit(50)
-            )
-        ).scalars().all()
+        rows = (await session.execute(
+            select(Order).where(Order.user_id == user.id).order_by(Order.id.desc()).limit(50)
+        )).scalars().all()
     return web.json_response([order_json(o) for o in rows])
 
 
@@ -245,234 +353,78 @@ async def cancel_order(request: web.Request):
     user = current_user(request)
     async with Session() as session:
         order = await _own_order(session, user, request.match_info["id"])
-        if order.status != "awaiting_payment":
+        if order.status not in ("awaiting_payment", "confirmed"):
             raise ApiError(400, "Этот заказ уже нельзя отменить — напиши в поддержку")
-        await services.change_status(session, order, "cancelled")
+        await services.change_status(session, order, "cancelled", actor="Покупатель")
+        await services.notify_admins(f"✖️ Покупатель отменил заказ #{order.id}")
     return web.json_response(order_json(order))
 
 
-# ---------- админка ----------
-
-def _clean_product(data: dict) -> dict:
-    title = str(data.get("title") or "").strip()[:200]
-    if not title:
-        raise ApiError(400, "Нужно название товара")
-    try:
-        price = int(data.get("price"))
-        sort = int(data.get("sort") or 0)
-    except (TypeError, ValueError):
-        raise ApiError(400, "Цена должна быть числом")
-    if price < 0:
-        raise ApiError(400, "Цена не может быть отрицательной")
-
-    sizes = services.clean_sizes(data.get("sizes"))
-    if not sizes:
-        raise ApiError(400, "Добавь хотя бы один размер")
-
-    photos = [str(p) for p in (data.get("photos") or []) if p][:10]
-    return {
-        "title": title,
-        "description": str(data.get("description") or "").strip()[:3000],
-        "category": str(data.get("category") or "").strip()[:100],
-        "price": price,
-        "sizes": sizes,
-        "photos": photos,
-        "is_active": bool(data.get("is_active", True)),
-        "sort": sort,
-    }
-
-
-@routes.get("/api/admin/products")
-async def admin_products(request: web.Request):
-    admin_user(request)
+@routes.post("/api/orders/{id}/rate")
+async def rate_order(request: web.Request):
+    user = current_user(request)
+    data = await read_json(request)
+    rating = services.to_int(data.get("rating"))
+    if not 1 <= rating <= 5:
+        raise ApiError(400, "Оценка от 1 до 5")
     async with Session() as session:
-        rows = (await session.execute(select(Product).order_by(Product.sort, Product.id.desc()))).scalars().all()
-    return web.json_response([product_json(p) for p in rows])
-
-
-@routes.post("/api/admin/products")
-async def admin_create_product(request: web.Request):
-    user = admin_user(request)
-    values = _clean_product(await read_json(request))
-    async with Session() as session:
-        product = await services.create_product(session, values, user.id)
-    return web.json_response(product_json(product))
-
-
-@routes.put("/api/admin/products/{id}")
-async def admin_update_product(request: web.Request):
-    user = admin_user(request)
-    values = _clean_product(await read_json(request))
-    async with Session() as session:
-        product = await session.get(Product, int(request.match_info["id"]))
-        if not product:
-            raise ApiError(404, "Товар не найден")
-        services.apply_sizes(session, product, values.pop("sizes"), user.id)
-        for key, value in values.items():
-            setattr(product, key, value)
+        order = await _own_order(session, user, request.match_info["id"])
+        if order.status != "done":
+            raise ApiError(400, "Оценить можно после получения заказа")
+        order.rating = rating
+        order.rating_comment = str(data.get("comment") or "").strip()[:1000] or None
         await session.commit()
-    return web.json_response(product_json(product))
+    stars = "★" * rating + "☆" * (5 - rating)
+    comment = f"\n💬 {order.rating_comment}" if order.rating_comment else ""
+    await services.notify_admins(f"⭐ Оценка заказа #{order.id}: {stars}{comment}")
+    return web.json_response(order_json(order))
 
 
-# ---------- склад ----------
+# ---------- профиль, баллы, награды ----------
 
-KIND_LABELS = {"receipt": "Приход", "sale": "Продажа", "return": "Возврат", "adjust": "Корректировка"}
-
-
-@routes.get("/api/admin/stock")
-async def admin_stock(request: web.Request):
-    admin_user(request)
-    product_id = request.query.get("product_id")
-    query = select(StockMovement).order_by(StockMovement.id.desc()).limit(100)
-    if product_id:
-        query = query.where(StockMovement.product_id == int(product_id))
+@routes.get("/api/profile")
+async def profile(request: web.Request):
+    tg_user = current_user(request)
     async with Session() as session:
-        products = (await session.execute(select(Product).order_by(Product.sort, Product.id.desc()))).scalars().all()
-        movements = (await session.execute(query)).scalars().all()
-        received = (
-            await session.execute(
-                select(func.coalesce(func.sum(StockMovement.delta * StockMovement.cost), 0)).where(
-                    StockMovement.kind == "receipt", StockMovement.cost.is_not(None)
-                )
-            )
-        ).scalar_one()
-    return web.json_response(
-        {
-            "products": [product_json(p) for p in products],
-            "units": sum(s["stock"] for p in products for s in p.sizes),
-            "received_value": int(received),
-            "movements": [
-                {
-                    "id": m.id,
-                    "product_id": m.product_id,
-                    "product_title": m.product_title,
-                    "size": m.size,
-                    "delta": m.delta,
-                    "kind": m.kind,
-                    "kind_label": KIND_LABELS.get(m.kind, m.kind),
-                    "cost": m.cost,
-                    "note": m.note,
-                    "created_at": m.created_at.isoformat() if m.created_at else None,
-                }
-                for m in movements
-            ],
-        }
-    )
+        user = await services.upsert_user(session, tg_user)
+        settings = await services.get_settings(session)
+        products_map = {p.id: p for p in (await session.execute(select(Product))).scalars()}
+        coupons = (await session.execute(
+            select(Coupon).where(Coupon.user_id == tg_user.id).order_by(Coupon.id.desc()))).scalars()
+        rewards = (await session.execute(
+            select(Reward).where(Reward.is_active.is_(True)).order_by(Reward.sort, Reward.cost))).scalars()
+        history = await finance.points_history(session, tg_user.id)
+        orders_count = (await session.execute(
+            select(func.count()).select_from(Order).where(Order.user_id == tg_user.id))).scalar_one()
+    cur = settings["currency"]
+    return web.json_response({
+        "user": user_json(user),
+        "coupons": [loyalty.coupon_json(c, products_map, cur) for c in coupons],
+        "rewards": [loyalty.reward_json(r, products_map, cur) for r in rewards],
+        "history": history,
+        "orders_count": orders_count,
+    })
 
 
-@routes.post("/api/admin/stock/receipt")
-async def admin_stock_receipt(request: web.Request):
-    user = admin_user(request)
-    data = await read_json(request)
-    cost = data.get("cost")
-    try:
-        cost = int(cost) if cost not in (None, "") else None
-    except (TypeError, ValueError):
-        raise ApiError(400, "Цена закупки должна быть числом")
-    async with Session() as session:
-        product = await session.get(Product, int(data.get("product_id") or 0))
-        if not product:
-            raise ApiError(404, "Товар не найден")
-        await services.receive_stock(
-            session, product, data.get("items") or [], cost=cost,
-            note=str(data.get("note") or "Приход товара").strip(), admin_id=user.id,
-        )
-    return web.json_response(product_json(product))
-
-
-@routes.delete("/api/admin/products/{id}")
-async def admin_delete_product(request: web.Request):
-    admin_user(request)
-    async with Session() as session:
-        product = await session.get(Product, int(request.match_info["id"]))
-        if product:
-            await session.delete(product)
-            await session.commit()
-    return web.json_response({"ok": True})
-
-
-@routes.post("/api/admin/upload")
-async def admin_upload(request: web.Request):
-    """Загружает фото товара в Telegram (себе в чат и сразу удаляет) и возвращает file_id."""
-    user = admin_user(request)
-    content, filename, content_type = await read_upload(request)
-    if content_type not in PHOTO_KINDS:
-        raise ApiError(400, "Нужна картинка JPG или PNG")
-    try:
-        msg = await bot.send_photo(user.id, BufferedInputFile(content, filename=filename), disable_notification=True)
-    except Exception as exc:
-        log.warning("upload failed: %s", exc)
-        raise ApiError(400, "Не удалось загрузить фото. Напиши боту /start и попробуй снова")
-    try:
-        await bot.delete_message(user.id, msg.message_id)
-    except Exception:
-        pass
-    return web.json_response({"file_id": msg.photo[-1].file_id})
-
-
-@routes.get("/api/admin/orders")
-async def admin_orders(request: web.Request):
-    admin_user(request)
-    status = request.query.get("status")
-    query = select(Order).order_by(Order.id.desc()).limit(200)
-    if status:
-        query = query.where(Order.status == status)
-    async with Session() as session:
-        rows = (await session.execute(query)).scalars().all()
-    return web.json_response([order_json(o, admin=True) for o in rows])
-
-
-@routes.get("/api/admin/orders/{id}")
-async def admin_order(request: web.Request):
-    admin_user(request)
-    async with Session() as session:
-        order = await session.get(Order, int(request.match_info["id"]))
-    if not order:
-        raise ApiError(404, "Заказ не найден")
-    return web.json_response(order_json(order, admin=True))
-
-
-@routes.post("/api/admin/orders/{id}/status")
-async def admin_order_status(request: web.Request):
-    admin_user(request)
+@routes.post("/api/profile/register")
+async def register(request: web.Request):
+    tg_user = current_user(request)
     data = await read_json(request)
     async with Session() as session:
-        order = await session.get(Order, int(request.match_info["id"]))
-        if not order:
-            raise ApiError(404, "Заказ не найден")
-        await services.change_status(session, order, str(data.get("status")), data.get("track"))
-    return web.json_response(order_json(order, admin=True))
+        user = await loyalty.register_user(session, tg_user, data.get("name"), data.get("phone"))
+    return web.json_response(user_json(user))
 
 
-@routes.get("/api/admin/settings")
-async def admin_settings(request: web.Request):
-    admin_user(request)
+@routes.post("/api/rewards/{id}/exchange")
+async def exchange(request: web.Request):
+    tg_user = current_user(request)
     async with Session() as session:
-        return web.json_response(await services.get_settings(session))
-
-
-@routes.put("/api/admin/settings")
-async def admin_save_settings(request: web.Request):
-    admin_user(request)
-    data = await read_json(request)
-    async with Session() as session:
-        return web.json_response(await services.save_settings(session, data))
-
-
-@routes.get("/api/admin/stats")
-async def admin_stats(request: web.Request):
-    admin_user(request)
-    async with Session() as session:
-        by_status = dict(
-            (await session.execute(select(Order.status, func.count()).group_by(Order.status))).all()
-        )
-        revenue = (
-            await session.execute(
-                select(func.coalesce(func.sum(Order.total), 0)).where(Order.status.in_(["paid", "shipped", "done"]))
-            )
-        ).scalar_one()
-        users = (await session.execute(select(func.count()).select_from(User))).scalar_one()
-        products_count = (await session.execute(select(func.count()).select_from(Product))).scalar_one()
-    return web.json_response(
-        {"by_status": by_status, "revenue": int(revenue), "users": users, "products": products_count}
-    )
+        user = await session.get(User, tg_user.id)
+        reward = await session.get(Reward, int(request.match_info["id"]))
+        if not user or not reward:
+            raise ApiError(404, "Награда не найдена")
+        coupon = await loyalty.exchange_reward(session, user, reward)
+        settings = await services.get_settings(session)
+        products_map = {p.id: p for p in (await session.execute(select(Product))).scalars()}
+    return web.json_response({"coupon": loyalty.coupon_json(coupon, products_map, settings["currency"]),
+                              "points": user.points})

@@ -6,6 +6,8 @@ from aiohttp import ClientSession, web
 from aiogram.types import BotCommand, MenuButtonWebApp, WebAppInfo
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
+import api_admin
+import tasks
 from api import cors_middleware, routes
 from config import BASE_URL, BOT_TOKEN, DISABLE_BOT, PORT, WEBAPP_URL
 from db import init_db
@@ -27,6 +29,7 @@ async def setup_bot() -> None:
             BotCommand(command="catalog", description="Каталог"),
             BotCommand(command="cart", description="Корзина"),
             BotCommand(command="orders", description="Мои заказы"),
+            BotCommand(command="profile", description="Профиль и баллы"),
             BotCommand(command="support", description="Написать в поддержку"),
             BotCommand(command="help", description="Как сделать заказ"),
         ]
@@ -51,6 +54,7 @@ async def keep_awake() -> None:
 def build_app() -> web.Application:
     app = web.Application(middlewares=[cors_middleware], client_max_size=20 * 1024 * 1024)
     app.add_routes(routes)
+    app.add_routes(api_admin.routes)
     return app
 
 
@@ -68,6 +72,7 @@ def run_webhook() -> None:
             allowed_updates=dp.resolve_used_update_types(),
         )
         app["keep_awake"] = asyncio.create_task(keep_awake())
+        app["tasks"] = asyncio.create_task(tasks.run_forever())
         log.info("webhook mode: %s", BASE_URL)
 
     app.on_startup.append(on_startup)
@@ -83,6 +88,7 @@ async def run_local() -> None:
     if DISABLE_BOT:
         await asyncio.Event().wait()
     await setup_bot()
+    asyncio.create_task(tasks.run_forever())
     await bot.delete_webhook()
     await dp.start_polling(bot)
 

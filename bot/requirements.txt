@@ -3,3 +3,4 @@ python-dotenv>=1.0
 SQLAlchemy[asyncio]>=2.0.30,<3
 aiosqlite>=0.20
 asyncpg>=0.29
+openpyxl>=3.1
