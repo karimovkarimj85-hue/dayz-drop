@@ -272,6 +272,43 @@ BAD_SIZES = "Не понял размеры. " + SIZES_HINT
 SAVED = "✅ Сохранено"
 
 
+KIND_LABELS = {"receipt": "📥 Приход", "sale": "🛒 Продажа", "return": "↩️ Возврат", "adjust": "✏️ Корректировка"}
+RECEIPT_PICK = "📥 <b>Приход товара</b>\nНа какой товар оформляем поступление?"
+RECEIPT_ASK_COST = "💵 Цена закупки за 1 шт (чтобы считать вложения) — или нажми «Пропустить»:"
+
+
+def receipt_ask_items(product) -> str:
+    current = ", ".join(f"{e(s['size'])}: {s['stock']}" for s in product.sizes) or "—"
+    return (
+        f"📥 <b>Приход: {e(product.title)}</b>\n"
+        f"Сейчас на складе: {current}\n\n"
+        "Сколько штук пришло? Пришли по размерам, например:\n<code>M 5, L 3, XL 2</code>\n"
+        "Новый размер тоже можно — он добавится."
+    )
+
+
+def receipt_done(product, items: list, cost: int | None, currency: str) -> str:
+    added = ", ".join(f"{e(i['size'])} +{i['qty']}" for i in items if i["qty"] > 0)
+    units = sum(i["qty"] for i in items if i["qty"] > 0)
+    now = ", ".join(f"{e(s['size'])}: {s['stock']}" for s in product.sizes)
+    text = f"✅ <b>Оприходовано: {e(product.title)}</b>\nПришло: {added} ({units} шт)\nТеперь на складе: {now}"
+    if cost is not None:
+        text += f"\nЗакупка: {money(cost, currency)} × {units} = <b>{money(cost * units, currency)}</b>"
+    return text
+
+
+def movements(rows: list) -> str:
+    if not rows:
+        return "📜 <b>Движения склада</b>\n\nПока пусто."
+    lines = ["📜 <b>Движения склада</b> (последние 20)", ""]
+    for m in rows:
+        date = m.created_at.strftime("%d.%m %H:%M") if m.created_at else ""
+        sign = f"+{m.delta}" if m.delta > 0 else str(m.delta)
+        note = f" — {e(m.note)}" if m.note else ""
+        lines.append(f"{date} {KIND_LABELS.get(m.kind, m.kind)} {e(m.product_title)} {e(m.size)} <b>{sign}</b>{note}")
+    return "\n".join(lines)
+
+
 def admin_settings(settings: dict) -> str:
     return (
         "⚙️ <b>Настройки</b>\n\n"

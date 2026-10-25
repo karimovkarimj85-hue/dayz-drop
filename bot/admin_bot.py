@@ -13,7 +13,7 @@ import keyboards
 import services
 import texts
 from config import ADMIN_IDS, WEBAPP_URL
-from db import Order, Product, Session, User
+from db import Order, Product, Session, StockMovement, User
 from loader import bot
 from shop_bot import support_threads
 from ui import btn, chunks, kb, show
@@ -62,6 +62,11 @@ class EditSetting(StatesGroup):
 
 class ShipTrack(StatesGroup):
     track = State()
+
+
+class StockReceipt(StatesGroup):
+    items = State()
+    cost = State()
 
 
 def parse_sizes(text: str) -> list[dict] | None:
@@ -124,6 +129,7 @@ async def admin_menu_view():
         [btn(f"📦 Отправить ({counts.get('paid', 0)})", "ol:paid:0"), btn(f"🚚 В пути ({counts.get('shipped', 0)})", "ol:shipped:0")],
         [btn("🗂 Все заказы", "ol:all:0")],
         [btn("➕ Добавить товар", "np"), btn("👕 Товары", "apl:0")],
+        [btn("📥 Приход товара", "srp:0"), btn("📜 Движения склада", "smv")],
         [btn("⚙️ Настройки", "aset"), btn("📊 Статистика", "astat")],
     ]
     if WEBAPP_URL:
@@ -387,7 +393,10 @@ async def on_product_value(message: Message, state: FSMContext) -> None:
         value = value[:3000] if field == "description" else value[:200]
     async with Session() as session:
         product = await session.get(Product, data["product_id"])
-        setattr(product, field, value)
+        if field == "sizes":
+            services.apply_sizes(session, product, value, message.from_user.id)
+        else:
+            setattr(product, field, value)
         await session.commit()
     await state.clear()
     await message.answer(texts.SAVED)
@@ -518,20 +527,106 @@ async def np_photo(message: Message, state: FSMContext) -> None:
 async def np_done(call: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     async with Session() as session:
-        product = Product(
-            title=data["title"],
-            category=data["category"],
-            price=data["price"],
-            description=data["description"],
-            sizes=data["sizes"],
-            photos=data.get("photos", []),
-        )
-        session.add(product)
-        await session.commit()
+        product = await services.create_product(session, {
+            "title": data["title"],
+            "category": data["category"],
+            "price": data["price"],
+            "description": data["description"],
+            "sizes": data["sizes"],
+            "photos": data.get("photos", []),
+        }, call.from_user.id)
     await state.clear()
     await call.answer("Товар добавлен!")
     await call.message.answer("✅ Товар добавлен и уже виден в каталоге.")
     await send_product_card(call.message, product.id)
+
+
+# ---------- склад: приход и журнал ----------
+
+@router.callback_query(F.data.startswith("srp:"))
+async def cb_receipt_pick(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    page = int(call.data.split(":")[1])
+    async with Session() as session:
+        products = list((await session.execute(select(Product).order_by(Product.sort, Product.id.desc()))).scalars())
+    rows = [[btn(f"{p.title} · {texts.stock_total(p)} шт", f"sr:{p.id}")] for p in products[page * PAGE:(page + 1) * PAGE]]
+    nav = []
+    if page > 0:
+        nav.append(btn("◀️", f"srp:{page - 1}"))
+    if (page + 1) * PAGE < len(products):
+        nav.append(btn("▶️", f"srp:{page + 1}"))
+    rows += [nav, [btn("➕ Новый товар", "np")], [btn("⬅️ Админка", "adm")]]
+    text = texts.RECEIPT_PICK if products else "Сначала добавь товар — приход оформляется на существующий товар."
+    await show(call, text, kb(*rows))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("sr:"))
+async def cb_receipt_start(call: CallbackQuery, state: FSMContext) -> None:
+    product_id = int(call.data.split(":")[1])
+    async with Session() as session:
+        product = await session.get(Product, product_id)
+    if not product:
+        await call.answer("Товар не найден", show_alert=True)
+        return
+    await state.set_state(StockReceipt.items)
+    await state.update_data(product_id=product_id)
+    await call.message.answer(texts.receipt_ask_items(product), reply_markup=kb([btn("❌ Отмена", "adm")]))
+    await call.answer()
+
+
+@router.message(StockReceipt.items, F.text, NOT_COMMAND)
+async def on_receipt_items(message: Message, state: FSMContext) -> None:
+    items = parse_sizes(message.text)
+    if not items or not any(i["stock"] > 0 for i in items):
+        await message.answer(texts.BAD_SIZES)
+        return
+    await state.update_data(items=[{"size": i["size"], "qty": i["stock"]} for i in items])
+    await state.set_state(StockReceipt.cost)
+    await message.answer(texts.RECEIPT_ASK_COST, reply_markup=kb([btn("Пропустить", "sr_nocost")]))
+
+
+async def _finish_receipt(message: Message, state: FSMContext, admin_id: int, cost: int | None) -> None:
+    data = await state.get_data()
+    await state.clear()
+    async with Session() as session:
+        product = await session.get(Product, data["product_id"])
+        try:
+            await services.receive_stock(session, product, data["items"], cost=cost, note="Приход товара", admin_id=admin_id)
+        except services.ShopError as exc:
+            await message.answer(f"⚠️ {texts.e(exc)}")
+            return
+        currency = (await services.get_settings(session))["currency"]
+    await message.answer(
+        texts.receipt_done(product, data["items"], cost, currency),
+        reply_markup=kb([btn("📥 Ещё приход", "srp:0"), btn("📜 Движения", "smv")], [btn("⬅️ Админка", "adm")]),
+    )
+
+
+@router.message(StockReceipt.cost, F.text, NOT_COMMAND)
+async def on_receipt_cost(message: Message, state: FSMContext) -> None:
+    cost = parse_price(message.text)
+    if cost is None:
+        await message.answer(texts.BAD_PRICE)
+        return
+    await _finish_receipt(message, state, message.from_user.id, cost)
+
+
+@router.callback_query(StockReceipt.cost, F.data == "sr_nocost")
+async def on_receipt_no_cost(call: CallbackQuery, state: FSMContext) -> None:
+    await call.message.edit_reply_markup(reply_markup=None)
+    await _finish_receipt(call.message, state, call.from_user.id, None)
+    await call.answer()
+
+
+@router.callback_query(F.data == "smv")
+async def cb_movements(call: CallbackQuery) -> None:
+    async with Session() as session:
+        movements = list(
+            (await session.execute(select(StockMovement).order_by(StockMovement.id.desc()).limit(20))).scalars()
+        )
+    await show(call, texts.movements(movements), kb([btn("📥 Приход товара", "srp:0")], [btn("⬅️ Админка", "adm")]))
+    await call.answer()
 
 
 # ---------- настройки и статистика ----------

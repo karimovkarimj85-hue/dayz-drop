@@ -12,7 +12,7 @@ from sqlalchemy import func, select
 
 import services
 from config import ADMIN_IDS, BOT_TOKEN
-from db import Order, Product, Session, User
+from db import Order, Product, Session, StockMovement, User
 from loader import bot
 
 log = logging.getLogger(__name__)
@@ -265,17 +265,7 @@ def _clean_product(data: dict) -> dict:
     if price < 0:
         raise ApiError(400, "Цена не может быть отрицательной")
 
-    sizes, seen = [], set()
-    for s in data.get("sizes") or []:
-        size = str(s.get("size") or "").strip()[:20]
-        if not size or size in seen:
-            continue
-        try:
-            stock = max(0, int(s.get("stock") or 0))
-        except (TypeError, ValueError):
-            stock = 0
-        seen.add(size)
-        sizes.append({"size": size, "stock": stock})
+    sizes = services.clean_sizes(data.get("sizes"))
     if not sizes:
         raise ApiError(400, "Добавь хотя бы один размер")
 
@@ -302,26 +292,91 @@ async def admin_products(request: web.Request):
 
 @routes.post("/api/admin/products")
 async def admin_create_product(request: web.Request):
-    admin_user(request)
+    user = admin_user(request)
     values = _clean_product(await read_json(request))
     async with Session() as session:
-        product = Product(**values)
-        session.add(product)
-        await session.commit()
+        product = await services.create_product(session, values, user.id)
     return web.json_response(product_json(product))
 
 
 @routes.put("/api/admin/products/{id}")
 async def admin_update_product(request: web.Request):
-    admin_user(request)
+    user = admin_user(request)
     values = _clean_product(await read_json(request))
     async with Session() as session:
         product = await session.get(Product, int(request.match_info["id"]))
         if not product:
             raise ApiError(404, "Товар не найден")
+        services.apply_sizes(session, product, values.pop("sizes"), user.id)
         for key, value in values.items():
             setattr(product, key, value)
         await session.commit()
+    return web.json_response(product_json(product))
+
+
+# ---------- склад ----------
+
+KIND_LABELS = {"receipt": "Приход", "sale": "Продажа", "return": "Возврат", "adjust": "Корректировка"}
+
+
+@routes.get("/api/admin/stock")
+async def admin_stock(request: web.Request):
+    admin_user(request)
+    product_id = request.query.get("product_id")
+    query = select(StockMovement).order_by(StockMovement.id.desc()).limit(100)
+    if product_id:
+        query = query.where(StockMovement.product_id == int(product_id))
+    async with Session() as session:
+        products = (await session.execute(select(Product).order_by(Product.sort, Product.id.desc()))).scalars().all()
+        movements = (await session.execute(query)).scalars().all()
+        received = (
+            await session.execute(
+                select(func.coalesce(func.sum(StockMovement.delta * StockMovement.cost), 0)).where(
+                    StockMovement.kind == "receipt", StockMovement.cost.is_not(None)
+                )
+            )
+        ).scalar_one()
+    return web.json_response(
+        {
+            "products": [product_json(p) for p in products],
+            "units": sum(s["stock"] for p in products for s in p.sizes),
+            "received_value": int(received),
+            "movements": [
+                {
+                    "id": m.id,
+                    "product_id": m.product_id,
+                    "product_title": m.product_title,
+                    "size": m.size,
+                    "delta": m.delta,
+                    "kind": m.kind,
+                    "kind_label": KIND_LABELS.get(m.kind, m.kind),
+                    "cost": m.cost,
+                    "note": m.note,
+                    "created_at": m.created_at.isoformat() if m.created_at else None,
+                }
+                for m in movements
+            ],
+        }
+    )
+
+
+@routes.post("/api/admin/stock/receipt")
+async def admin_stock_receipt(request: web.Request):
+    user = admin_user(request)
+    data = await read_json(request)
+    cost = data.get("cost")
+    try:
+        cost = int(cost) if cost not in (None, "") else None
+    except (TypeError, ValueError):
+        raise ApiError(400, "Цена закупки должна быть числом")
+    async with Session() as session:
+        product = await session.get(Product, int(data.get("product_id") or 0))
+        if not product:
+            raise ApiError(404, "Товар не найден")
+        await services.receive_stock(
+            session, product, data.get("items") or [], cost=cost,
+            note=str(data.get("note") or "Приход товара").strip(), admin_id=user.id,
+        )
     return web.json_response(product_json(product))
 
 

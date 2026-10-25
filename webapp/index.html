@@ -7,15 +7,17 @@
   <link rel="icon" href="assets/icon.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Exo+2:ital,wght@1,700;1,800;1,900&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css">
+  <!-- На iPhone/Mac используется системный SF Pro, на Android/Windows — Inter -->
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <!-- ?v= меняем при каждом обновлении, иначе Telegram показывает старую версию из кэша -->
+  <link rel="stylesheet" href="style.css?v=2">
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <script src="config.js"></script>
+  <script src="config.js?v=2"></script>
 </head>
 <body>
   <main id="view" class="view"></main>
   <nav id="nav" class="nav"></nav>
   <div id="toast" class="toast"></div>
-  <script src="app.js"></script>
+  <script src="app.js?v=2"></script>
 </body>
 </html>

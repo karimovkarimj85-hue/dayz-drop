@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import keyboards
 import texts
 from config import ADMIN_IDS
-from db import Cart, Order, Product, Setting, User
+from db import Cart, Order, Product, Setting, StockMovement, User
 from loader import bot
 
 log = logging.getLogger(__name__)
@@ -169,7 +169,7 @@ async def create_order(session: AsyncSession, tg_user, data: dict) -> Order:
     if not wanted:
         raise ShopError("Корзина пуста")
 
-    items, total = [], 0
+    items, total, sold = [], 0, []
     for (product_id, size), qty in wanted.items():
         product = await session.get(Product, product_id, with_for_update=True)
         if not product or not product.is_active:
@@ -183,6 +183,7 @@ async def create_order(session: AsyncSession, tg_user, data: dict) -> Order:
             raise ShopError(f"«{product.title}», размер {size}: осталось только {left} шт.")
         entry["stock"] -= qty
         product.sizes = sizes  # новый список, чтобы SQLAlchemy заметил изменение JSON
+        sold.append((product, size, qty))
         items.append(
             {
                 "product_id": product.id,
@@ -207,6 +208,9 @@ async def create_order(session: AsyncSession, tg_user, data: dict) -> Order:
         total=total,
     )
     session.add(order)
+    await session.flush()  # нужен номер заказа для журнала склада
+    for product, size, qty in sold:
+        log_movement(session, product, size, -qty, "sale", note=f"Заказ #{order.id}")
     await session.commit()
 
     await safe_send(order.user_id, texts.order_created(order, settings), reply_markup=keyboards.order_kb(order.id))
@@ -228,6 +232,79 @@ async def _restore_stock(session: AsyncSession, order: Order) -> None:
         else:
             sizes.append({"size": item["size"], "stock": item["qty"]})
         product.sizes = sizes
+        log_movement(session, product, item["size"], item["qty"], "return", note=f"Отмена заказа #{order.id}")
+
+
+# ---------- склад ----------
+
+def log_movement(session, product, size: str, delta: int, kind: str, *, note: str = "",
+                 cost: int | None = None, admin_id: int | None = None) -> None:
+    if delta:
+        session.add(StockMovement(product_id=product.id, product_title=product.title, size=size, delta=delta,
+                                  kind=kind, cost=cost, note=note[:500], admin_id=admin_id))
+
+
+def clean_sizes(raw: list) -> list[dict]:
+    sizes, seen = [], set()
+    for s in raw or []:
+        size = str(s.get("size") or "").strip()[:20]
+        if not size or size in seen:
+            continue
+        try:
+            stock = max(0, int(s.get("stock") or 0))
+        except (TypeError, ValueError):
+            stock = 0
+        seen.add(size)
+        sizes.append({"size": size, "stock": stock})
+    return sizes
+
+
+async def create_product(session: AsyncSession, values: dict, admin_id: int | None) -> Product:
+    """Новый товар; начальные остатки записываются в журнал как приход."""
+    product = Product(**values)
+    session.add(product)
+    await session.flush()
+    for s in product.sizes:
+        log_movement(session, product, s["size"], s["stock"], "receipt", note="Создание товара", admin_id=admin_id)
+    await session.commit()
+    return product
+
+
+def apply_sizes(session, product: Product, new_sizes: list[dict], admin_id: int | None,
+                note: str = "Ручная правка остатков") -> None:
+    """Меняет размеры/остатки вручную и пишет разницу в журнал как корректировку."""
+    old = {s["size"]: s["stock"] for s in product.sizes}
+    new = {s["size"]: s["stock"] for s in new_sizes}
+    for size in dict.fromkeys([*old, *new]):
+        log_movement(session, product, size, new.get(size, 0) - old.get(size, 0), "adjust", note=note, admin_id=admin_id)
+    product.sizes = [dict(s) for s in new_sizes]
+
+
+async def receive_stock(session: AsyncSession, product: Product, items: list[dict], *, cost: int | None,
+                        note: str, admin_id: int | None) -> Product:
+    """Оприходование: пришедшее количество по размерам прибавляется к остатку."""
+    sizes = [dict(s) for s in product.sizes]
+    added = 0
+    for item in items:
+        size = str(item.get("size") or "").strip()[:20]
+        try:
+            qty = int(item.get("qty") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        if not size or qty <= 0:
+            continue
+        entry = _size_entry(sizes, size)
+        if entry:
+            entry["stock"] += qty
+        else:
+            sizes.append({"size": size, "stock": qty})
+        log_movement(session, product, size, qty, "receipt", note=note, cost=cost, admin_id=admin_id)
+        added += qty
+    if not added:
+        raise ShopError("Укажи, сколько штук пришло хотя бы по одному размеру")
+    product.sizes = sizes
+    await session.commit()
+    return product
 
 
 async def change_status(session: AsyncSession, order: Order, status: str, track: str | None = None) -> Order:

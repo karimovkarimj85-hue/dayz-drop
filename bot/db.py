@@ -91,6 +91,23 @@ class Order(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
 
+class StockMovement(Base):
+    """Журнал склада: каждое изменение остатка — приход, продажа, возврат или корректировка."""
+
+    __tablename__ = "stock_movements"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    product_id: Mapped[int] = mapped_column(Integer, index=True)
+    product_title: Mapped[str] = mapped_column(String(200))
+    size: Mapped[str] = mapped_column(String(20))
+    delta: Mapped[int] = mapped_column(Integer)
+    kind: Mapped[str] = mapped_column(String(10))  # receipt | sale | return | adjust
+    cost: Mapped[int | None] = mapped_column(Integer)  # цена закупки за штуку (для прихода)
+    note: Mapped[str] = mapped_column(Text, default="")
+    admin_id: Mapped[int | None] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class Cart(Base):
     """Корзина для покупок через кнопки бота: [{"product_id", "size", "qty"}]."""
 
