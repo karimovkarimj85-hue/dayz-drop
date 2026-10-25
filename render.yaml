@@ -1,0 +1,22 @@
+# Render Blueprint: сервер бота + API мини-аппа на бесплатном тарифе.
+# BOT_TOKEN и DATABASE_URL Render спросит при создании — в репозиторий они не попадают.
+services:
+  - type: web
+    name: dayz-drop-bot
+    runtime: python
+    plan: free
+    rootDir: bot
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: ADMIN_IDS
+        value: "1125022050,424376040"
+      - key: WEBAPP_URL
+        value: https://karimovkarimj85-hue.github.io/dayz-drop/
